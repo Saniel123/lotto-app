@@ -608,7 +608,7 @@ export default function App() {
                   ) : selectedNumbers.length !== SWERTRES_GAME.pickCount ? (
                     `PICK ${SWERTRES_GAME.pickCount - selectedNumbers.length} MORE DIGITS`
                   ) : (
-                    `BUY SWERTRES TICKET (0.001 BCH ≈ ₱${ticketPhp})`
+                    `BUY TICKET(0.001 BCH ≈ ₱${ticketPhp})`
                   )}
                 </Button>
               )}
