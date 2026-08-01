@@ -1,10 +1,23 @@
 import { useState, useEffect, useRef } from "react";
 import { ElectrumNetworkProvider } from "cashscript";
-import LotteryArtifact from "./contracts/Lottery.json";
+import type { Contract } from "cashscript";
 
 import { Button } from "./components/ui/button";
 import { Card } from "./components/ui/card";
 import LotteryDrawMachine from "./components/LotteryDrawMachine";
+import {
+  generateWallet,
+  getWalletBalanceSats,
+  walletFromPrivateKey,
+  privateKeyToHex,
+  privateKeyFromHex,
+} from "./contracts/wallet";
+import type { WalletKeypair } from "./contracts/wallet";
+import {
+  getLotteryContract,
+  buyTicket as chainBuyTicket,
+  resolveDraw as chainResolveDraw,
+} from "./contracts/lotteryClient";
 import {
   ShieldCheck,
   Trophy,
@@ -23,23 +36,38 @@ import {
   Hash,
   Layers,
   Clock,
-  Zap,
+  Link2,
   Lock,
+  AlertTriangle,
 } from "lucide-react";
 
-// Network Config
+// NOTE ON PROJECT LAYOUT ASSUMED HERE: this file imports the four files
+// from the zip as ./lottery/{wallet.ts,lotteryClient.ts,Lottery.json,Lottery.cash}
+// (lotteryClient.ts already imports "./Lottery.json" relative to itself, so
+// they need to stay siblings). Adjust the two import paths above if your
+// project actually places them elsewhere.
+
+// Chain read access shared by the estimated-countdown -> chain-resolution
+// flow below (block height/header polling). wallet.ts and lotteryClient.ts
+// each open their own ElectrumNetworkProvider("chipnet") too — three
+// independent connections for one page. Harmless on chipnet, but if this
+// ever matters (connection limits, etc.) the fix is to have wallet.ts and
+// lotteryClient.ts accept an injected provider instead of constructing
+// their own.
 const provider = new ElectrumNetworkProvider("chipnet");
 
 // PCSO-style Digit Lotto Games — each game just varies how many digit
 // chambers the draw machine shows (pickCount) and the digit range
-// (maxNumber). Ticket price and jackpot pool scale up with difficulty.
+// (maxNumber). Ticket price scales with difficulty. Jackpot is no longer a
+// seeded constant: on-chain, every draw slot gets its own fresh contract
+// UTXO (see "PER-SLOT CONTRACTS" below), so the pool is whatever has
+// actually been paid into that slot's contract address.
 interface LottoGame {
   id: string;
   name: string;
   shortLabel: string;
   maxNumber: number;
   pickCount: number;
-  jackpotBch: number;
   drawDays: string;
   ticketPriceSats: bigint;
 }
@@ -51,7 +79,6 @@ const LOTTO_GAMES: LottoGame[] = [
     shortLabel: "2D",
     maxNumber: 9,
     pickCount: 2,
-    jackpotBch: 2.0,
     drawDays: "Daily (11AM, 4PM, 9PM)",
     ticketPriceSats: 50000n, // 0.0005 BCH
   },
@@ -61,7 +88,6 @@ const LOTTO_GAMES: LottoGame[] = [
     shortLabel: "3D",
     maxNumber: 9,
     pickCount: 3,
-    jackpotBch: 15.0,
     drawDays: "Daily (2PM, 5PM, 9PM)",
     ticketPriceSats: 100000n, // 0.001 BCH
   },
@@ -71,7 +97,6 @@ const LOTTO_GAMES: LottoGame[] = [
     shortLabel: "4D",
     maxNumber: 9,
     pickCount: 4,
-    jackpotBch: 40.0,
     drawDays: "Tue · Fri · Sun 9PM",
     ticketPriceSats: 150000n, // 0.0015 BCH
   },
@@ -81,15 +106,26 @@ const LOTTO_GAMES: LottoGame[] = [
     shortLabel: "6D",
     maxNumber: 9,
     pickCount: 6,
-    jackpotBch: 90.0,
     drawDays: "Daily 9PM",
     ticketPriceSats: 200000n, // 0.002 BCH
   },
 ];
 
+// maxTicketRange fed to the contract's constructor: the full combination
+// space for a game's digit count (e.g. Swertres = 000-999 = 1000). The
+// contract's resolveDraw() picks a single winningNumber in [1, range], and
+// (winningNumber - 1) zero-padded to pickCount digits gives the drawn
+// digits — same representation the original mock used, just now derived
+// from a value the chain itself will accept.
+function maxTicketRangeFor(game: LottoGame): number {
+  return 10 ** game.pickCount;
+}
+
 interface TicketItem {
   id: string;
   game: string;
+  gameId: string;
+  slotEpochMs: number; // identifies which per-slot contract this ticket belongs to
   numbers: number[];
   txid: string;
   address: string;
@@ -98,18 +134,16 @@ interface TicketItem {
 }
 
 // ---------------------------------------------------------------------------
-// SYNCHRONIZED DRAW SCHEDULE
+// PRESET DRAW SCHEDULE — used only to display an estimated "next draw" time
+// AND to derive each slot's drawDeadline (unix seconds) for the contract
+// constructor. It does NOT decide the result. See AUTHORITATIVE DRAW
+// RESOLUTION below.
 // ---------------------------------------------------------------------------
-// Real lotteries run on a single preset draw time shared by every ticket
-// holder — that's what keeps results identical across users and keeps the
-// prize pool coherent (everyone is being evaluated against the same outcome
-// at the same instant). Below, each game gets a fixed set of daily/weekly
-// draw slots. `days` is 0=Sun..6=Sat; omit for "every day".
 interface DrawSlot {
   hour: number;
   minute: number;
   days?: number[];
-}
+} // days: 0=Sun..6=Sat
 
 const DRAW_SCHEDULES: Record<string, DrawSlot[]> = {
   ez2: [
@@ -126,9 +160,19 @@ const DRAW_SCHEDULES: Record<string, DrawSlot[]> = {
   "6d": [{ hour: 21, minute: 0 }],
 };
 
-// Betting closes this many ms before a scheduled draw fires, so no one can
-// time a last-second entry against a result that's effectively already set.
-const BETTING_CUTOFF_MS = 10_000;
+// Betting closes this many ms before the estimated slot time, giving a
+// safety margin before the chain is even expected to resolve the draw.
+const BETTING_CUTOFF_MS = 60_000;
+
+// How long past drawDeadline a slot's contract stays reclaimable via
+// reclaimRefund() if nobody ever calls resolveDraw() on it (e.g. no block
+// clears the PoW check — see the flagged bug below). Baked into every
+// slot contract's constructor params; this file doesn't add refund UI yet.
+const REFUND_GRACE_SECONDS = 7 * 24 * 60 * 60;
+
+// Chipnet-only persistence — see the privacy note on privateKeyToHex/
+// privateKeyFromHex in wallet.ts before reusing this pattern for real funds.
+const WALLET_STORAGE_KEY = "pcso-mocknet-lotto:chipnet-privkey-hex";
 
 function getNextDrawDate(gameId: string, from: Date): Date {
   const slots = DRAW_SCHEDULES[gameId] ?? [{ hour: 21, minute: 0 }];
@@ -154,37 +198,6 @@ function getNextDrawDate(gameId: string, from: Date): Date {
   return fallback;
 }
 
-// Deterministic PRNG seeded from the game + the exact scheduled slot
-// timestamp. Any client resolving this same slot arrives at the same
-// numbers — that's the "synchronous, single shared result" property a real
-// draw needs, instead of each user's browser rolling its own Math.random().
-function hashStringToInt(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return hash >>> 0;
-}
-
-function mulberry32(seed: number) {
-  return function () {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function generateSyncedDraw(game: LottoGame, slotEpochMs: number): number[] {
-  const seed = hashStringToInt(`${game.id}:${slotEpochMs}`);
-  const rng = mulberry32(seed);
-  return Array.from({ length: game.pickCount }, () =>
-    Math.floor(rng() * (game.maxNumber + 1)),
-  );
-}
-
 function formatCountdown(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSec / 3600);
@@ -201,33 +214,210 @@ function formatSlotTime(d: Date): string {
   });
 }
 
-export default function App() {
-  const isInitializing = useRef(false);
+// ---------------------------------------------------------------------------
+// AUTHORITATIVE DRAW RESOLUTION — anchored to the Bitcoin Cash chain, never
+// to any single client's clock or a per-tab setInterval, AND now matched
+// against the exact math Lottery.cash's resolveDraw() will itself check on
+// chain (not just a client-side lookalike RNG).
+// ---------------------------------------------------------------------------
+// The countdown/schedule above is only a convenience ESTIMATE shown to the
+// user; it never feeds into the actual result. The actual result is: "the
+// first mined block whose header timestamp is >= slot time", read off the
+// public chain, which is why every tab / every device converges on the same
+// answer independent of local clocks or which tab's timer fires first.
 
+interface ResolvedDraw {
+  gameId: string;
+  slotEpochMs: number;
+  blockHeight: number;
+  blockHash: string; // conventional reversed-byte display hash
+  headerHex: string; // raw 80-byte header, hex — needed to submit resolveDraw()
+  winningNumber: number; // 1..maxTicketRange, exactly what the contract derives
+  numbers: number[]; // winningNumber-1 as zero-padded digits, for the UI
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++)
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+}
+
+function bytesToHexReversed(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .reverse()
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Block header timestamp lives at byte offset 68, 4 bytes, little-endian.
+function parseHeaderTimestamp(headerHex: string): number {
+  const bytes = hexToBytes(headerHex);
+  const view = new DataView(bytes.buffer);
+  return view.getUint32(68, true);
+}
+
+async function doubleSha256(bytes: Uint8Array): Promise<Uint8Array> {
+  const first = await crypto.subtle.digest("SHA-256", bytes);
+  const second = await crypto.subtle.digest("SHA-256", first);
+  return new Uint8Array(second);
+}
+
+// Thin wrappers around the Electrum connection. Method names follow the
+// standard Electrum protocol; adjust if your pinned provider version
+// exposes a higher-level helper instead of a raw performRequest passthrough.
+async function fetchChainHeight(): Promise<number> {
+  const tip = await (provider as any).performRequest(
+    "blockchain.headers.subscribe",
+  );
+  return tip.height;
+}
+
+async function fetchBlockHeader(height: number): Promise<string | null> {
+  try {
+    const res = await (provider as any).performRequest(
+      "blockchain.block.header",
+      height,
+    );
+    return typeof res === "string" ? res : res.hex;
+  } catch {
+    return null; // height hasn't been mined yet — normal, just means "not resolved yet"
+  }
+}
+
+// Scans forward from `fromHeight` for the first block whose timestamp has
+// reached the scheduled slot. Pure function of the chain's public state —
+// any client running it lands on the same block.
+async function findResolvingBlock(slotEpochMs: number, fromHeight: number) {
+  let height = fromHeight;
+  for (let i = 0; i < 5000; i++) {
+    // sane upper bound on the scan
+    const header = await fetchBlockHeader(height);
+    if (!header) return null; // chain hasn't reached this height yet — try again on next poll
+    const ts = parseHeaderTimestamp(header) * 1000;
+    if (ts >= slotEpochMs) return { height, header };
+    height++;
+  }
+  return null;
+}
+
+// int(bytes32) / OP_BIN2NUM semantics: a byte string is read as a
+// little-endian, sign-and-magnitude script number — byte[0] is the least
+// significant byte, and the MSB of the last byte is a sign flag. hash256()
+// output effectively never sets that top bit in a way that matters here
+// (mod of a huge positive number), so this treats the digest as an
+// unsigned little-endian integer for the purposes of the modulo.
+//
+// UNVERIFIED: this has not been run through an actual cashc/cashscript-VM
+// simulation (no network in this sandbox to install cashscript), so this
+// is a best-effort match of the ABI/bytecode's OP_BIN2NUM + OP_MOD, not a
+// confirmed one. Before trusting the UI's predicted winning digits to be
+// exactly what an on-chain resolveDraw() will accept, run one resolveDraw
+// call on chipnet and diff the digits it derives against this function's
+// output for the same header.
+function bigIntFromLEBytes(bytes: Uint8Array): bigint {
+  let result = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) {
+    result = (result << 8n) | BigInt(bytes[i]);
+  }
+  return result;
+}
+
+function deriveWinningNumber(
+  rawDigest: Uint8Array,
+  maxTicketRange: number,
+): number {
+  const asInt = bigIntFromLEBytes(rawDigest);
+  const range = BigInt(maxTicketRange);
+  return Number((asInt % range) + 1n);
+}
+
+function winningNumberToDigits(
+  winningNumber: number,
+  pickCount: number,
+): number[] {
+  return String(winningNumber - 1)
+    .padStart(pickCount, "0")
+    .split("")
+    .map(Number);
+}
+
+// *** FLAGGED CONTRACT BUG — see write-up at the end of the response ***
+// Lottery.cash's proof-of-work guard is `require(blockHash.split(3)[0] ==
+// 0x000000)`, i.e. it checks the FIRST 3 bytes of the raw (non-reversed)
+// hash256(header) output. But the near-zero bytes that mining difficulty
+// actually produces sit at the END of that raw byte order — they only end
+// up "leading" after the conventional display reversal (the same
+// reversal bytesToHexReversed() below performs, and that the codebase's
+// own comments describe). Checking bytes[0..2] instead of bytes[29..31]
+// checks essentially random low-order bytes, unrelated to real proof of
+// work. As written, resolveDraw() will very rarely accept a genuinely
+// mined header, and — worse — could in principle be satisfied by a
+// cheaply hand-fabricated 80-byte string that never did any hashing work,
+// which defeats the anti-spam purpose of the check entirely.
+//
+// This function mirrors what the check most likely *should* be (tail
+// bytes), so the UI's local proof-of-work gate is meaningful — but the
+// deployed .cash contract itself needs `split(3)[0]` changed to
+// `split(29)[1]` (and recompiled/redeployed) before resolveDraw() calls
+// built against this UI will actually succeed on chain.
+function hasMinimalProofOfWork(rawDigest: Uint8Array): boolean {
+  return rawDigest[29] === 0 && rawDigest[30] === 0 && rawDigest[31] === 0;
+}
+
+export default function App() {
   // Live Exchange Rate State
   const [bchToPhpRate, setBchToPhpRate] = useState<number | null>(null);
 
-  // Mocknet Wallet State
-  const [walletConnected, setWalletConnected] = useState(false);
-  const [userBchAddress, setUserBchAddress] = useState("");
-  const [walletBalanceSats, setWalletBalanceSats] =
-    useState<bigint>(1000000000n); // 10 BCH Mock Balance
+  // --- Real chipnet wallet state -------------------------------------
+  // The keypair lives only in React state: it is regenerated fresh on
+  // every "Connect Wallet" click and is gone on refresh. There is no
+  // persistence layer here — fine for a chipnet demo (coins are
+  // worthless play-money), NOT fine to ship as-is if this were ever
+  // pointed at mainnet, where losing the in-memory key loses real funds.
+  // Add encrypted persistence (or a proper wallet-connect flow) before
+  // that happens.
+  const [wallet, setWallet] = useState<WalletKeypair | null>(null);
+  const [walletBalanceSats, setWalletBalanceSats] = useState<bigint>(0n);
+  const [walletLoading, setWalletLoading] = useState(false);
+  const [walletError, setWalletError] = useState<string | null>(null);
 
   // Active Game Selection State — drives the draw machine, ticket price, and jackpot pool
   const [selectedGameId, setSelectedGameId] = useState<string>("swertres");
   const activeGame =
     LOTTO_GAMES.find((g) => g.id === selectedGameId) ?? LOTTO_GAMES[1];
 
-  // Per-game Covenant Pool Balances — each game keeps its own jackpot so switching
-  // games doesn't bleed one prize pool into another
-  const [contractBalances, setContractBalances] = useState<
+  // --- PER-SLOT CONTRACTS ---------------------------------------------
+  // The contract's constructor bakes in drawDeadline, so a NEW contract
+  // address exists for every (game, slot) pair — there's no single
+  // long-lived "the Swertres contract". This also means jackpots don't
+  // roll over automatically the way the old mock's shared pool did: a
+  // fresh slot starts with ZERO on-chain balance and needs its own
+  // funding UTXO before anyone can buyTicket() into it (see the
+  // "Lottery contract has no UTXO yet" error surfaced below) — this file
+  // has no genesis-funding flow, that's a separate piece of work.
+  const contractCacheRef = useRef<Map<string, Contract>>(new Map());
+  function getSlotContract(game: LottoGame, slotEpochMs: number): Contract {
+    const drawDeadline = Math.floor(slotEpochMs / 1000);
+    const key = `${game.id}:${drawDeadline}`;
+    const cached = contractCacheRef.current.get(key);
+    if (cached) return cached;
+    const contract = getLotteryContract({
+      ticketPriceSats: game.ticketPriceSats,
+      maxTicketRange: maxTicketRangeFor(game),
+      drawDeadline,
+      refundDeadline: drawDeadline + REFUND_GRACE_SECONDS,
+    });
+    contractCacheRef.current.set(key, contract);
+    return contract;
+  }
+
+  // Live on-chain balance of the active game's upcoming-slot contract —
+  // polled, not simulated. Also polled per-game for the sidebar cards.
+  const [activeContractSats, setActiveContractSats] = useState<bigint>(0n);
+  const [gameContractSats, setGameContractSats] = useState<
     Record<string, bigint>
-  >(
-    Object.fromEntries(
-      LOTTO_GAMES.map((g) => [g.id, BigInt(Math.round(g.jackpotBch * 1e8))]),
-    ),
-  );
-  const contractBalanceSats = contractBalances[selectedGameId] ?? 0n;
+  >({});
 
   // Game & Ticket State
   const [selectedNumbers, setSelectedNumbers] = useState<number[]>([]);
@@ -241,18 +431,22 @@ export default function App() {
     null,
   );
   const [drawMessage, setDrawMessage] = useState<string | null>(null);
-  const [lastSecret, setLastSecret] = useState<string | null>(null);
+  const [resolvedDraw, setResolvedDraw] = useState<ResolvedDraw | null>(null);
+  const [resolveTxid, setResolveTxid] = useState<string | null>(null);
 
-  // Testing Force-Win State & Celebration Modal State
+  // Testing Force-Win State & Celebration Modal State — UI preview only,
+  // never touches the chain or a real payout.
   const [forceWinMode, setForceWinMode] = useState(false);
   const [showPopupCelebration, setShowPopupCelebration] = useState(false);
   const [wonPrizePhp, setWonPrizePhp] = useState("");
 
-  const [loading, setLoading] = useState(false);
   const [txPending, setTxPending] = useState(false);
-  const [drawPending, setDrawPending] = useState(false);
+  const [resolvePending, setResolvePending] = useState(false);
+  const [drawPending, setDrawPending] = useState(false); // true while LotteryDrawMachine plays the reveal animation
+  const [chainChecking, setChainChecking] = useState(false);
+  const [chainError, setChainError] = useState<string | null>(null);
 
-  // --- Synchronized draw scheduling state ---
+  // --- Estimated schedule (display only — never decides the result) ---
   const [nextDrawAt, setNextDrawAt] = useState<Date>(() =>
     getNextDrawDate(selectedGameId, new Date()),
   );
@@ -260,13 +454,14 @@ export default function App() {
     () => nextDrawAt.getTime() - Date.now(),
   );
 
-  // Captures which game + which scheduled slot a draw was resolving, so a
-  // late-resolving draw always credits/matches against the right game and
-  // the right result — even if the UI has since moved to another game.
+  // Tracks which chain height we've scanned up to per game+slot, so polling
+  // resumes instead of rescanning from scratch, and so a game switch doesn't
+  // carry over another game's scan position.
+  const scanFromHeightRef = useRef<Record<string, number>>({});
+  const resolvedSlotKeyRef = useRef<string | null>(null); // guards against re-resolving the same slot twice
+  const scheduledResultRef = useRef<number[] | null>(null);
   const drawingGameIdRef = useRef(selectedGameId);
   const drawingSlotEpochRef = useRef<number>(nextDrawAt.getTime());
-  const firedSlotRef = useRef<number | null>(null);
-  const scheduledResultRef = useRef<number[] | null>(null);
 
   // 1. Fetch Live BCH to PHP Conversion Rate
   useEffect(() => {
@@ -290,65 +485,232 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // 2. Connect Mocknet Local Wallet
-  const connectMocknetWallet = () => {
-    setLoading(true);
-    setTimeout(() => {
-      const fakeAddress = "bchtest:qpm20082t9q86pt326402436d8m57q42as2s4r8322";
-      setUserBchAddress(fakeAddress);
-      setWalletBalanceSats(1000000000n);
-      setWalletConnected(true);
-      setLoading(false);
-    }, 400);
+  // 2. Connect a real chipnet wallet: generates a fresh keypair locally
+  // (never sent anywhere) and reads its live balance from chipnet. A
+  // brand-new address has 0 sats — direct the user to a chipnet faucet.
+  // The private key is saved to localStorage so a page refresh restores
+  // the SAME address instead of abandoning any funds sent to it — see the
+  // privacy note on privateKeyToHex/privateKeyFromHex in wallet.ts; this
+  // is only an acceptable place to keep a private key because chipnet
+  // coins have no real value.
+  const connectWallet = async () => {
+    setWalletLoading(true);
+    setWalletError(null);
+    try {
+      const kp = generateWallet();
+      localStorage.setItem(WALLET_STORAGE_KEY, privateKeyToHex(kp.privateKey));
+      setWallet(kp);
+      const bal = await getWalletBalanceSats(kp.address);
+      setWalletBalanceSats(bal);
+    } catch (err) {
+      console.error("Wallet generation/balance fetch failed:", err);
+      setWalletError(
+        err instanceof Error
+          ? err.message
+          : "Could not create a chipnet wallet.",
+      );
+    } finally {
+      setWalletLoading(false);
+    }
   };
 
+  // 2a. On mount, restore a previously-saved key instead of leaving the
+  // user disconnected (and instead of ever silently generating a new one
+  // out from under an existing saved key).
+  useEffect(() => {
+    const savedHex = localStorage.getItem(WALLET_STORAGE_KEY);
+    if (!savedHex) return;
+    setWalletLoading(true);
+    try {
+      const kp = walletFromPrivateKey(privateKeyFromHex(savedHex));
+      setWallet(kp);
+    } catch (err) {
+      console.error("Failed to restore saved wallet:", err);
+      setWalletError("Could not restore your saved chipnet wallet.");
+    } finally {
+      setWalletLoading(false);
+    }
+    // Balance is fetched by the polling effect below once `wallet` is set.
+  }, []);
+
+  // 2b. Poll the connected wallet's real balance.
+  useEffect(() => {
+    if (!wallet) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const bal = await getWalletBalanceSats(wallet.address);
+        if (!cancelled) setWalletBalanceSats(bal);
+      } catch (err) {
+        console.warn("Wallet balance poll failed:", err);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 20000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [wallet]);
+
+  // Clears the saved key and returns to the disconnected state. Does NOT
+  // move any funds — if the address was funded, those chipnet coins stay
+  // at that address; reconnecting later requires the same private key
+  // (there isn't a recovery phrase flow here), so this is a "start over
+  // with a new address" action, not a safe wallet-switch.
+  const disconnectWallet = () => {
+    localStorage.removeItem(WALLET_STORAGE_KEY);
+    setWallet(null);
+    setWalletBalanceSats(0n);
+    setWalletError(null);
+  };
+
+  // 2c. Poll each game's upcoming-slot contract balance for the sidebar,
+  // and keep activeContractSats in sync with the selected game.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      const entries = await Promise.all(
+        LOTTO_GAMES.map(async (game) => {
+          const slot =
+            game.id === selectedGameId
+              ? nextDrawAt
+              : getNextDrawDate(game.id, new Date());
+          try {
+            const contract = getSlotContract(game, slot.getTime());
+            const utxos = await contract.getUtxos();
+            const total = utxos.reduce(
+              (sum, u) => sum + BigInt(u.satoshis),
+              0n,
+            );
+            return [game.id, total] as const;
+          } catch (err) {
+            console.warn(`Contract balance poll failed for ${game.id}:`, err);
+            return [game.id, 0n] as const;
+          }
+        }),
+      );
+      if (cancelled) return;
+      const next = Object.fromEntries(entries);
+      setGameContractSats(next);
+      setActiveContractSats(next[selectedGameId] ?? 0n);
+    };
+    poll();
+    const id = setInterval(poll, 20000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGameId, nextDrawAt]);
+
   // Game Selection Handler — swaps the active game, resets any in-progress pick,
-  // clears the previous game's draw result, and re-syncs the countdown to this
-  // game's own preset schedule.
+  // clears the previous game's draw result, and re-syncs the ESTIMATED countdown
+  // to this game's own schedule. Actual resolution still only comes from the chain.
   const handleSelectGame = (gameId: string) => {
     if (drawPending || gameId === selectedGameId) return;
     setSelectedGameId(gameId);
     setSelectedNumbers([]);
     setLastWinningNumbers(null);
     setDrawMessage(null);
-    setLastSecret(null);
-    firedSlotRef.current = null;
+    setResolvedDraw(null);
+    setResolveTxid(null);
+    setChainError(null);
     scheduledResultRef.current = null;
     setNextDrawAt(getNextDrawDate(gameId, new Date()));
   };
 
-  // 3. Master clock — ticks every second, drives the countdown display, and
-  // is the ONLY thing that triggers a draw. No per-user "Run Draw" click:
-  // the result fires exactly once, for everyone, at the preset slot time.
+  // 3. Estimated countdown display only — this loop never fires a draw.
   useEffect(() => {
-    const tick = () => {
-      const now = Date.now();
-      const remaining = nextDrawAt.getTime() - now;
-      setMsRemaining(remaining);
-
-      if (
-        remaining <= 0 &&
-        !drawPending &&
-        firedSlotRef.current !== nextDrawAt.getTime()
-      ) {
-        firedSlotRef.current = nextDrawAt.getTime();
-        drawingGameIdRef.current = selectedGameId;
-        drawingSlotEpochRef.current = nextDrawAt.getTime();
-        scheduledResultRef.current = generateSyncedDraw(
-          activeGame,
-          nextDrawAt.getTime(),
-        );
-        setDrawPending(true);
-        setDrawMessage(null);
-        setLastSecret(null);
-        setLastWinningNumbers(null);
-      }
-    };
+    const tick = () => setMsRemaining(nextDrawAt.getTime() - Date.now());
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
+  }, [nextDrawAt]);
+
+  // 4. Chain polling — the ONLY thing that can produce a result. Every open
+  // tab runs this same deterministic scan against the same public chain, so
+  // every tab converges on the same resolving block and the same numbers,
+  // whenever it happens to check. The winning digits are now derived with
+  // the exact int(bytes32)/OP_MOD math the contract itself uses (see
+  // deriveWinningNumber above), not a lookalike client-side RNG.
+  useEffect(() => {
+    let cancelled = false;
+    const gameId = selectedGameId;
+    const slotEpochMs = nextDrawAt.getTime();
+    const slotKey = `${gameId}:${slotEpochMs}`;
+
+    const poll = async () => {
+      if (cancelled || drawPending) return;
+      if (resolvedSlotKeyRef.current === slotKey) return; // already resolved this exact slot
+      if (Date.now() < slotEpochMs) return; // estimated slot hasn't arrived; nothing to check yet
+
+      try {
+        setChainChecking(true);
+        setChainError(null);
+
+        if (scanFromHeightRef.current[gameId] === undefined) {
+          scanFromHeightRef.current[gameId] = await fetchChainHeight();
+        }
+
+        const found = await findResolvingBlock(
+          slotEpochMs,
+          scanFromHeightRef.current[gameId],
+        );
+        if (cancelled) return;
+
+        if (found) {
+          const rawDigest = await doubleSha256(hexToBytes(found.header));
+
+          if (!hasMinimalProofOfWork(rawDigest)) {
+            // Doesn't clear the (corrected) proof-of-work floor — keep
+            // scanning forward from the next height instead of stalling.
+            scanFromHeightRef.current[gameId] = found.height + 1;
+            return;
+          }
+
+          const blockHash = bytesToHexReversed(rawDigest);
+          const game = LOTTO_GAMES.find((g) => g.id === gameId) ?? activeGame;
+          const range = maxTicketRangeFor(game);
+          const winningNumber = deriveWinningNumber(rawDigest, range);
+          const numbers = winningNumberToDigits(winningNumber, game.pickCount);
+
+          resolvedSlotKeyRef.current = slotKey;
+          drawingGameIdRef.current = gameId;
+          drawingSlotEpochRef.current = slotEpochMs;
+          scheduledResultRef.current = numbers;
+
+          setResolvedDraw({
+            gameId,
+            slotEpochMs,
+            blockHeight: found.height,
+            blockHash,
+            headerHex: found.header,
+            winningNumber,
+            numbers,
+          });
+          setDrawMessage(null);
+          setLastWinningNumbers(null);
+          setResolveTxid(null);
+          setDrawPending(true); // hand off to LotteryDrawMachine for the reveal animation
+        }
+        // if not found yet: chain hasn't reached the resolving block — next poll will check again
+      } catch (err) {
+        console.warn("Chain poll failed, will retry:", err);
+        if (!cancelled) setChainError("Could not reach the chain — retrying…");
+      } finally {
+        if (!cancelled) setChainChecking(false);
+      }
+    };
+
+    poll();
+    const id = setInterval(poll, 15000); // pace polling to block-arrival cadence, not wall-clock ticks
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextDrawAt, drawPending, selectedGameId]);
+  }, [nextDrawAt, selectedGameId, drawPending]);
 
   // Number Picker Helpers
   const toggleNumber = (num: number) => {
@@ -372,119 +734,157 @@ export default function App() {
     setSelectedNumbers(numbers);
   };
 
-  // Betting is closed once we're inside the cutoff window before the next
-  // scheduled draw, or while a draw is actively resolving.
+  // Betting is closed once we're inside the cutoff window before the
+  // estimated slot, once the slot has passed and we're waiting on the chain
+  // to resolve, or while a draw is actively animating.
   const bettingClosed =
     drawPending ||
     (msRemaining > 0 && msRemaining <= BETTING_CUTOFF_MS) ||
     msRemaining <= 0;
 
-  // Buy Ticket Handler
+  // Buy Ticket Handler — builds and broadcasts a real chipnet transaction
+  // via lotteryClient.ts's buyTicket(). Requires: a connected wallet with
+  // a UTXO covering price+fee, AND the active slot's contract already
+  // holding a UTXO to build on top of (see PER-SLOT CONTRACTS note).
   const handleBuyTicket = async () => {
     if (
-      !walletConnected ||
+      !wallet ||
       selectedNumbers.length !== activeGame.pickCount ||
       bettingClosed
     )
       return;
     setTxPending(true);
+    setChainError(null);
 
     try {
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      const contract = getSlotContract(activeGame, nextDrawAt.getTime());
+      const pickedBytes = new Uint8Array(selectedNumbers); // one byte per digit, 0-9
 
-      const price = activeGame.ticketPriceSats;
-      setWalletBalanceSats((prev) => prev - price);
-      setContractBalances((prev) => ({
-        ...prev,
-        [activeGame.id]: (prev[activeGame.id] ?? 0n) + price,
-      }));
+      const result = await chainBuyTicket(
+        contract,
+        activeGame.ticketPriceSats,
+        wallet.pkHash,
+        pickedBytes,
+        wallet.privateKey,
+        wallet.address,
+      );
 
-      const mockTxid =
-        "tx_mocknet_" + Math.random().toString(36).substring(2, 12);
       const ticketId = "TCK-" + Math.floor(100000 + Math.random() * 900000);
-      const timestampStr = new Date().toLocaleString();
-
       const newTicket: TicketItem = {
         id: ticketId,
         game: activeGame.name,
+        gameId: activeGame.id,
+        slotEpochMs: nextDrawAt.getTime(),
         numbers: selectedNumbers,
-        txid: mockTxid,
-        address: userBchAddress,
-        amountSats: price,
-        timestamp: timestampStr,
+        txid: (result as any)?.txid ?? String(result),
+        address: wallet.address,
+        amountSats: activeGame.ticketPriceSats,
+        timestamp: new Date().toLocaleString(),
       };
 
-      setPurchasedTickets([newTicket, ...purchasedTickets]);
+      setPurchasedTickets((prev) => [newTicket, ...prev]);
       setSelectedNumbers([]);
+
+      const bal = await getWalletBalanceSats(wallet.address);
+      setWalletBalanceSats(bal);
     } catch (err) {
-      console.error("Mocknet transaction evaluation failed:", err);
-      alert("Mocknet transaction failed.");
+      console.error("buyTicket failed:", err);
+      setChainError(
+        err instanceof Error ? err.message : "Ticket purchase failed.",
+      );
     } finally {
       setTxPending(false);
     }
   };
 
-  // TESTING ONLY: real draws wait for the preset schedule. This just pulls
-  // the next slot into "now" so you don't have to sit through real hours
-  // while testing — it does NOT change how the result is generated.
-  const handleFastForwardDraw = () => {
-    if (drawPending) return;
-    setNextDrawAt(new Date());
-  };
-
-  // Called by LotteryDrawMachine once all balls have physically been drawn from the chamber
-  const handleDrawComplete = (winningDraw: number[]) => {
+  // Called by LotteryDrawMachine once the animation finishes playing the
+  // already-resolved chain result. scheduledResultRef.current was fixed the
+  // moment the chain resolved (step 4 above) — this only decides whether
+  // *this browser's* wallet holds a matching ticket and, if so, submits the
+  // real resolveDraw() payout transaction.
+  //
+  // LIMITATION: winner-matching here only looks at tickets this session
+  // bought (purchasedTickets, in memory). The contract itself does not
+  // check that winnerPkHash corresponds to any real ticket at all —
+  // resolveDraw() is permissionless and pays whatever pkHash the caller
+  // supplies. A production version needs an indexer that scans every
+  // buyTicket() OP_RETURN commitment on-chain (not just this browser's
+  // local state) before it's safe to claim there's "no winner" and leave
+  // the pool for someone else to (rightfully or not) claim.
+  const handleDrawComplete = async (winningDraw: number[]) => {
     const drawnGameId = drawingGameIdRef.current;
-    const drawnSlotEpoch = drawingSlotEpochRef.current;
     const drawnGame =
       LOTTO_GAMES.find((g) => g.id === drawnGameId) ?? activeGame;
+    const resolution = resolvedDraw;
 
-    const generatedSecret =
-      "slot_" +
-      drawnSlotEpoch +
-      "_" +
-      Math.random().toString(36).substring(2, 6);
-    setLastSecret(generatedSecret);
     setLastWinningNumbers(winningDraw);
 
     const winningStr = winningDraw.join("");
     const matchingTicket = purchasedTickets.find(
-      (t) => t.game === drawnGame.name && t.numbers.join("") === winningStr,
+      (t) =>
+        t.gameId === drawnGameId &&
+        t.slotEpochMs === drawingSlotEpochRef.current &&
+        t.numbers.join("") === winningStr,
     );
 
-    if (matchingTicket) {
-      const prizeWonSats = contractBalances[drawnGameId] ?? 0n;
-      const prizeBch = Number(prizeWonSats) / 1e8;
-      const prizePhpCalc = bchToPhpRate
-        ? (prizeBch * bchToPhpRate).toLocaleString("en-PH", {
-            maximumFractionDigits: 0,
-          })
-        : "15,000,000";
+    if (matchingTicket && wallet && resolution) {
+      setResolvePending(true);
+      try {
+        const contract = getSlotContract(drawnGame, resolution.slotEpochMs);
+        const headerBytes = hexToBytes(resolution.headerHex);
+        const result = await chainResolveDraw(
+          contract,
+          headerBytes,
+          wallet.address,
+          wallet.pkHash,
+        );
+        const txid = (result as any)?.txid ?? String(result);
+        setResolveTxid(txid);
 
-      setWonPrizePhp(prizePhpCalc);
-      setWalletBalanceSats((prev) => prev + prizeWonSats);
-      setContractBalances((prev) => ({ ...prev, [drawnGameId]: 0n }));
-      setShowPopupCelebration(true);
-      setDrawMessage(
-        `🎉 JACKPOT WINNER! Your ${drawnGame.name} ticket ${winningStr} matched the ${formatSlotTime(new Date(drawnSlotEpoch))} draw! Prize successfully claimed!`,
-      );
+        const bal = await getWalletBalanceSats(wallet.address);
+        setWalletBalanceSats(bal);
+
+        const prizeBch = Number(activeContractSats) / 1e8;
+        const prizePhpCalc = bchToPhpRate
+          ? (prizeBch * bchToPhpRate).toLocaleString("en-PH", {
+              maximumFractionDigits: 0,
+            })
+          : "—";
+        setWonPrizePhp(prizePhpCalc);
+        setShowPopupCelebration(true);
+        setDrawMessage(
+          `🎉 JACKPOT WINNER! Your ${drawnGame.name} ticket ${winningStr} matched block #${resolution.blockHeight}. Payout tx: ${txid}`,
+        );
+      } catch (err) {
+        console.error("resolveDraw failed:", err);
+        setDrawMessage(
+          `Matched ${winningStr}, but the on-chain claim failed: ${
+            err instanceof Error ? err.message : "unknown error"
+          }`,
+        );
+      } finally {
+        setResolvePending(false);
+      }
     } else {
       setDrawMessage(
-        `❌ No matching ${drawnGame.name} tickets found for the ${formatSlotTime(new Date(drawnSlotEpoch))} draw combination ${winningStr}. Covenant pool rolls over to the next scheduled draw!`,
+        `No locally-held ${drawnGame.name} ticket matched block #${resolution?.blockHeight ?? "?"}'s combination ${winningStr}. The pool remains claimable on-chain by anyone who submits a valid resolveDraw() call.`,
       );
     }
 
     setDrawPending(false);
-    scheduledResultRef.current = null;
 
-    // Advance to the following scheduled slot for the game that just drew,
-    // so the countdown keeps running toward the next synchronized result.
-    const nextSlot = getNextDrawDate(
-      drawnGameId,
-      new Date(drawnSlotEpoch + 1000),
-    );
+    // Advance the estimated schedule to the following slot for the game that
+    // just resolved, so the countdown keeps running toward the next draw.
     if (drawnGameId === selectedGameId) {
+      const nextSlot = getNextDrawDate(
+        drawnGameId,
+        new Date(drawingSlotEpochRef.current + 1000),
+      );
       setNextDrawAt(nextSlot);
+      scanFromHeightRef.current[drawnGameId] =
+        (resolution?.blockHeight ??
+          scanFromHeightRef.current[drawnGameId] ??
+          0) + 1;
     }
   };
 
@@ -496,7 +896,7 @@ export default function App() {
       })
     : "...";
 
-  const contractBchBalance = Number(contractBalanceSats) / 1e8;
+  const contractBchBalance = Number(activeContractSats) / 1e8;
   const ticketBch = Number(activeGame.ticketPriceSats) / 1e8;
   const ticketPhp = bchToPhpRate
     ? (ticketBch * bchToPhpRate).toFixed(2)
@@ -508,7 +908,7 @@ export default function App() {
     : "...";
 
   const gameJackpotPhp = (game: LottoGame) => {
-    const bal = contractBalances[game.id] ?? 0n;
+    const bal = gameContractSats[game.id] ?? 0n;
     const bch = Number(bal) / 1e8;
     return bchToPhpRate
       ? (bch * bchToPhpRate).toLocaleString("en-PH", {
@@ -551,7 +951,9 @@ export default function App() {
                 ₱{wonPrizePhp}
               </div>
               <span className="text-[11px] font-mono text-emerald-400 block pt-1">
-                ✓ Deposited directly to your Mocknet wallet via Covenant
+                {resolveTxid
+                  ? `✓ Broadcast to chipnet — tx ${resolveTxid.slice(0, 18)}…`
+                  : "✓ Payout submitted via Covenant"}
               </span>
             </div>
 
@@ -623,7 +1025,9 @@ export default function App() {
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-slate-400">Transaction ID:</span>
-                  <span className="text-slate-300">{viewingTicket.txid}</span>
+                  <span className="text-slate-300 break-all text-right max-w-[200px]">
+                    {viewingTicket.txid}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-slate-400">Timestamp:</span>
@@ -654,39 +1058,53 @@ export default function App() {
             <h1 className="font-black tracking-wider text-base md:text-lg text-emerald-400 uppercase flex items-center gap-2">
               PCSO MOCKNET LOTTO{" "}
               <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-mono border border-emerald-500/30">
-                Realistic Tickets
+                Chipnet · Play Money Only
               </span>
             </h1>
             <p className="text-xs text-slate-400 font-mono">
-              Verifiable On-Chain Ticket Passes & Payouts
+              Real chipnet wallet & covenant contract — not real funds
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-4">
-          {walletConnected ? (
+          {wallet ? (
             <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-2xl px-4 py-2">
               <Wallet className="h-4 w-4 text-emerald-400" />
               <div className="flex flex-col text-right">
                 <span className="text-xs font-mono font-bold text-emerald-400">
-                  {bchBalance.toFixed(3)} BCH
+                  {bchBalance.toFixed(4)} BCH
                 </span>
                 <span className="text-[10px] font-mono text-slate-400">
                   ≈ ₱{phpBalance}
                 </span>
               </div>
+              <button
+                onClick={disconnectWallet}
+                className="text-[10px] font-mono text-slate-500 hover:text-rose-400 underline cursor-pointer ml-1"
+                title="Forget this wallet on this device (funds stay on-chain at the old address)"
+              >
+                Disconnect
+              </button>
             </div>
           ) : (
             <Button
-              onClick={connectMocknetWallet}
-              disabled={loading}
+              onClick={connectWallet}
+              disabled={walletLoading}
               className="rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm py-2.5 px-5 cursor-pointer shadow-lg shadow-emerald-500/10"
             >
-              <Bot className="h-4 w-4 mr-2" /> Connect Mocknet Wallet
+              <Bot className="h-4 w-4 mr-2" />
+              {walletLoading ? "Generating…" : "Connect Chipnet Wallet"}
             </Button>
           )}
         </div>
       </header>
+
+      {walletError && (
+        <div className="max-w-6xl mx-auto w-full mb-4 flex items-center gap-2 text-xs font-mono text-rose-400 bg-rose-500/10 border border-rose-500/20 rounded-xl px-4 py-2.5">
+          <AlertTriangle className="h-4 w-4 shrink-0" /> {walletError}
+        </div>
+      )}
 
       {/* Main Responsive Grid Container */}
       <main className="max-w-6xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-6 my-auto">
@@ -711,13 +1129,14 @@ export default function App() {
                 <Monitor className="h-4 w-4 text-emerald-400" /> Environment:
               </span>
               <span className="text-amber-400 font-bold">
-                Chipnet Mocknet (Ticket Pass)
+                Chipnet (Real Testnet, No Real Value)
               </span>
             </div>
           </div>
 
           {/* Live Ball-Draw Machine — chamber count/digit range follow the active
-              game, and only ever activates on the preset schedule below */}
+              game. Only activates once the chain has actually resolved a block
+              for the current slot (see chain-polling effect above). */}
           <LotteryDrawMachine
             active={drawPending}
             pickCount={activeGame.pickCount}
@@ -731,45 +1150,71 @@ export default function App() {
             onComplete={handleDrawComplete}
           />
 
-          {/* Mocknet Address & Synchronized Draw Schedule Box */}
+          {/* Chipnet Wallet & Chain-Anchored Draw Schedule Box */}
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
             <div className="flex justify-between items-center">
               <span className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                <QrCode className="h-5 w-5 text-emerald-400" /> Mocknet Wallet &
+                <QrCode className="h-5 w-5 text-emerald-400" /> Chipnet Wallet &
                 Draw Hub
               </span>
               <span className="text-[10px] font-mono text-slate-500 uppercase flex items-center gap-1">
-                <Lock className="h-3 w-3" /> Preset · Synchronized
+                <Lock className="h-3 w-3" /> Chain-Resolved
               </span>
             </div>
 
-            {/* Next Scheduled Draw — replaces the old per-user "Run Draw" button.
-                The result only fires once, for everyone, at this exact preset time. */}
-            <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5 flex flex-col md:flex-row items-center justify-between gap-4">
-              <div className="text-center md:text-left">
-                <span className="text-[10px] uppercase font-mono text-slate-400 tracking-wider flex items-center gap-1.5 justify-center md:justify-start">
-                  <Clock className="h-3.5 w-3.5 text-emerald-400" /> Next{" "}
-                  {activeGame.name} Draw
-                </span>
-                <div className="text-2xl md:text-3xl font-black font-mono tracking-widest text-emerald-400 mt-1">
-                  {drawPending ? "DRAWING…" : formatCountdown(msRemaining)}
+            {/* Next Scheduled Draw — the countdown is an estimate for the user's
+                convenience only. The real result comes from whichever BCH block
+                is mined at/after this time, checked identically by every client. */}
+            <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5 space-y-3">
+              <div className="flex flex-col md:flex-row items-center justify-between gap-4">
+                <div className="text-center md:text-left">
+                  <span className="text-[10px] uppercase font-mono text-slate-400 tracking-wider flex items-center gap-1.5 justify-center md:justify-start">
+                    <Clock className="h-3.5 w-3.5 text-emerald-400" /> Next{" "}
+                    {activeGame.name} Draw (estimate)
+                  </span>
+                  <div className="text-2xl md:text-3xl font-black font-mono tracking-widest text-emerald-400 mt-1">
+                    {drawPending
+                      ? resolvePending
+                        ? "CLAIMING…"
+                        : "REVEALING…"
+                      : formatCountdown(msRemaining)}
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-500 mt-1">
+                    Est. {formatSlotTime(nextDrawAt)}
+                    {bettingClosed && !drawPending && (
+                      <span className="text-rose-400 ml-2">
+                        · Betting closed
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="text-[11px] font-mono text-slate-500 mt-1">
-                  Scheduled for {formatSlotTime(nextDrawAt)}
-                  {bettingClosed && !drawPending && (
-                    <span className="text-rose-400 ml-2">· Betting closed</span>
+
+                <div className="text-[11px] font-mono text-slate-400 text-center md:text-right max-w-xs">
+                  {chainChecking && (
+                    <span className="text-amber-400 flex items-center gap-1.5 justify-center md:justify-end">
+                      <RefreshCw className="h-3 w-3 animate-spin" /> Checking
+                      chain for resolving block…
+                    </span>
+                  )}
+                  {chainError && (
+                    <span className="text-rose-400">{chainError}</span>
+                  )}
+                  {!chainChecking && !chainError && msRemaining > 0 && (
+                    <span>
+                      Result is decided by the chain, not the countdown.
+                    </span>
                   )}
                 </div>
               </div>
 
-              <Button
-                onClick={handleFastForwardDraw}
-                disabled={drawPending}
-                variant="outline"
-                className="bg-slate-900 border-slate-700 text-amber-300 hover:bg-slate-800 rounded-xl cursor-pointer disabled:opacity-40 text-xs"
-              >
-                <Zap className="h-3.5 w-3.5 mr-1.5" /> Testing: Fast-Forward
-              </Button>
+              {resolvedDraw && resolvedDraw.gameId === activeGame.id && (
+                <div className="pt-3 border-t border-slate-800 text-[11px] font-mono text-slate-400 flex items-center gap-1.5">
+                  <Link2 className="h-3 w-3 text-emerald-400" />
+                  Resolved from BCH block #{resolvedDraw.blockHeight} · hash{" "}
+                  {resolvedDraw.blockHash.slice(0, 16)}… — verifiable by anyone,
+                  on any device.
+                </div>
+              )}
             </div>
 
             {/* Jackpot / Covenant Pool Card */}
@@ -796,39 +1241,43 @@ export default function App() {
               </div>
 
               <div className="text-sm font-mono text-slate-400 pl-11">
-                ({contractBchBalance.toFixed(2)} BCH Total Contract Balance
-                Locked)
+                ({contractBchBalance.toFixed(4)} BCH Total Contract Balance
+                Locked{activeContractSats === 0n ? " — not yet funded" : ""})
               </div>
             </Card>
 
-            {/* Display Mocknet Address Details */}
+            {/* Display Chipnet Wallet Address Details */}
             <div className="bg-slate-950/80 p-4 rounded-xl border border-slate-800 space-y-2 font-mono text-xs">
               <div className="text-slate-400 flex items-center justify-between">
-                <span>Active Mocknet Address:</span>
+                <span>Active Chipnet Address:</span>
                 <span className="text-emerald-400 font-bold">
-                  {walletConnected ? "Connected" : "Disconnected"}
+                  {wallet ? "Connected" : "Disconnected"}
                 </span>
               </div>
               <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-emerald-300 break-all select-all flex items-center justify-between">
                 <span>
-                  {walletConnected
-                    ? userBchAddress
-                    : "bchtest:qpm20082t9q86pt326402436d8m57q42as2s4r8322 (Default Mock Address)"}
+                  {wallet
+                    ? wallet.address
+                    : "Connect a wallet to get a chipnet address"}
                 </span>
-                <Button
-                  onClick={() =>
-                    navigator.clipboard.writeText(
-                      walletConnected
-                        ? userBchAddress
-                        : "bchtest:qpm20082t9q86pt326402436d8m57q42as2s4r8322",
-                    )
-                  }
-                  variant="outline"
-                  className="h-7 text-[10px] bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700 cursor-pointer ml-2"
-                >
-                  Copy
-                </Button>
+                {wallet && (
+                  <Button
+                    onClick={() =>
+                      navigator.clipboard.writeText(wallet.address)
+                    }
+                    variant="outline"
+                    className="h-7 text-[10px] bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700 cursor-pointer ml-2"
+                  >
+                    Copy
+                  </Button>
+                )}
               </div>
+              {wallet && walletBalanceSats === 0n && (
+                <div className="text-[10px] text-amber-400">
+                  Balance is 0 — fund this address from a chipnet faucet before
+                  buying a ticket.
+                </div>
+              )}
             </div>
 
             {/* Guaranteed Win Testing Controls */}
@@ -840,9 +1289,11 @@ export default function App() {
                     Force-Win Testing Mode
                   </div>
                   <div className="text-[11px] text-slate-400 font-mono">
-                    Testing-only override: replaces the synchronized result with
-                    your own ticket numbers so you can preview the win
-                    celebration.
+                    Testing-only override: swaps the animation's numbers for
+                    your own ticket so you can preview the win celebration. It
+                    still triggers a real resolveDraw() call if you actually
+                    hold that ticket — this only changes which digits the
+                    animation plays, not what gets submitted to chain.
                   </div>
                 </div>
                 <button
@@ -874,16 +1325,25 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800 space-y-1.5">
-                  <div className="text-slate-400 flex items-center gap-1 font-bold text-[11px] uppercase tracking-wider text-emerald-400">
-                    <CheckCircle2 className="h-3.5 w-3.5" /> Entropy Proofs
-                    (`resolveDraw`)
+                {resolvedDraw && (
+                  <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800 space-y-1.5">
+                    <div className="text-slate-400 flex items-center gap-1 font-bold text-[11px] uppercase tracking-wider text-emerald-400">
+                      <CheckCircle2 className="h-3.5 w-3.5" /> Chain Proof
+                    </div>
+                    <div className="text-slate-300 break-all text-[11px]">
+                      <span className="text-slate-500">
+                        Block #{resolvedDraw.blockHeight}:
+                      </span>{" "}
+                      {resolvedDraw.blockHash}
+                    </div>
+                    {resolveTxid && (
+                      <div className="text-slate-300 break-all text-[11px]">
+                        <span className="text-slate-500">Payout tx:</span>{" "}
+                        {resolveTxid}
+                      </div>
+                    )}
                   </div>
-                  <div className="text-slate-300 break-all text-[11px]">
-                    <span className="text-slate-500">Slot Seed:</span>{" "}
-                    {lastSecret}
-                  </div>
-                </div>
+                )}
               </div>
             )}
 
@@ -899,7 +1359,8 @@ export default function App() {
         <div className="space-y-6">
           {/* Game Selector — PCSO-style vertical game picker in the sidebar.
               Clicking a card updates the active pickCount/maxDigit, ticket price,
-              jackpot pool, and re-syncs the countdown to that game's own schedule. */}
+              jackpot pool, and the ESTIMATED schedule display. Draw resolution
+              itself always comes from the chain-polling effect, never this UI. */}
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-xl">
             <div className="flex items-center gap-2 text-sm font-bold text-slate-200">
               <Layers className="h-4 w-4 text-emerald-400" /> Choose Your Game
@@ -939,7 +1400,7 @@ export default function App() {
                           Pick {game.pickCount} · 0-9
                         </div>
                         <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1">
-                          <Clock className="h-2.5 w-2.5" /> Next:{" "}
+                          <Clock className="h-2.5 w-2.5" /> Est:{" "}
                           {formatSlotTime(cardNextDraw)}
                         </div>
                         <div className="text-xs font-mono text-amber-400 font-bold mt-1">
@@ -1026,13 +1487,15 @@ export default function App() {
 
             {/* Action Purchase Button */}
             <div className="pt-2">
-              {!walletConnected ? (
+              {!wallet ? (
                 <Button
-                  onClick={connectMocknetWallet}
-                  disabled={loading}
+                  onClick={connectWallet}
+                  disabled={walletLoading}
                   className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-base py-6 rounded-xl shadow-lg shadow-emerald-500/20 cursor-pointer"
                 >
-                  CONNECT MOCKNET WALLET TO PLAY
+                  {walletLoading
+                    ? "GENERATING…"
+                    : "CONNECT CHIPNET WALLET TO PLAY"}
                 </Button>
               ) : (
                 <Button
@@ -1047,7 +1510,7 @@ export default function App() {
                   {txPending ? (
                     <RefreshCw className="h-5 w-5 animate-spin" />
                   ) : bettingClosed ? (
-                    "BETTING CLOSED — DRAW IN PROGRESS"
+                    "BETTING CLOSED — AWAITING DRAW"
                   ) : selectedNumbers.length !== activeGame.pickCount ? (
                     `PICK ${activeGame.pickCount - selectedNumbers.length} MORE DIGITS`
                   ) : (
@@ -1125,8 +1588,8 @@ export default function App() {
 
       {/* Footer */}
       <footer className="max-w-6xl mx-auto w-full text-center py-6 border-t border-slate-800/80 mt-8 text-xs text-slate-500 font-mono">
-        PCSO Mocknet Decentralized Lottery • Powered by CashScript & Bitcoin
-        Cash (BCH)
+        PCSO Mocknet Decentralized Lottery • Chipnet only, no real funds •
+        Powered by CashScript & Bitcoin Cash (BCH)
       </footer>
     </div>
   );

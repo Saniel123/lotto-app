@@ -1,20 +1,23 @@
 {
   "contractName": "Lottery",
   "constructorInputs": [
-    { "name": "operatorPk", "type": "pubkey" },
-    { "name": "secretHash", "type": "bytes20" },
     { "name": "ticketPrice", "type": "int" },
     { "name": "maxTicketRange", "type": "int" },
     { "name": "drawDeadline", "type": "int" },
     { "name": "refundDeadline", "type": "int" }
   ],
   "abi": [
-    { "name": "buyTicket", "inputs": [] },
+    {
+      "name": "buyTicket",
+      "inputs": [
+        { "name": "buyerPkHash", "type": "bytes20" },
+        { "name": "pickedNumbers", "type": "bytes" }
+      ]
+    },
     {
       "name": "resolveDraw",
       "inputs": [
-        { "name": "secret", "type": "bytes" },
-        { "name": "operatorSig", "type": "sig" },
+        { "name": "header", "type": "bytes" },
         { "name": "winnerPkHash", "type": "bytes20" }
       ]
     },
@@ -26,27 +29,30 @@
       ]
     }
   ],
-  "bytecode": "OP_6 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_INPUTINDEX OP_UTXOVALUE OP_3 OP_PICK OP_GREATERTHANOREQUAL OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_3 OP_ROLL OP_ADD OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE aa20 OP_ACTIVEBYTECODE OP_HASH256 OP_CAT 87 OP_CAT OP_EQUALVERIFY OP_2DROP OP_2DROP OP_2DROP OP_1 OP_ELSE OP_6 OP_PICK OP_1 OP_NUMEQUAL OP_IF OP_9 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_5 OP_ROLL OP_CHECKLOCKTIMEVERIFY OP_DROP OP_8 OP_ROLL OP_ROT OP_CHECKSIGVERIFY OP_6 OP_PICK OP_HASH160 OP_ROT OP_EQUALVERIFY OP_5 OP_ROLL OP_INPUTINDEX OP_OUTPOINTTXHASH OP_CAT OP_SHA256 OP_BIN2NUM OP_3 OP_ROLL OP_MOD OP_1ADD OP_0 OP_GREATERTHAN OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE 76a914 OP_ROT OP_CAT 88ac OP_CAT OP_0 OP_OUTPUTVALUE OP_ROT OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ELSE OP_6 OP_ROLL OP_2 OP_NUMEQUALVERIFY OP_5 OP_ROLL OP_CHECKLOCKTIMEVERIFY OP_DROP OP_6 OP_ROLL OP_6 OP_ROLL OP_CHECKSIGVERIFY OP_2DROP OP_2DROP OP_DROP OP_1 OP_ENDIF OP_ENDIF",
-  "source": "pragma cashscript ^0.13.0;\r\n\r\ncontract Lottery(\r\n    pubkey operatorPk,\r\n    bytes20 secretHash,\r\n    int ticketPrice,\r\n    int maxTicketRange,\r\n    int drawDeadline,\r\n    int refundDeadline\r\n) {\r\n    function buyTicket() {\r\n        // Enforce exact ticket fee requirement\r\n        require(tx.inputs[this.activeInputIndex].value >= ticketPrice);\r\n\r\n        int currentBalance = tx.inputs[this.activeInputIndex].value;\r\n        int newBalance = currentBalance + ticketPrice;\r\n\r\n        require(tx.outputs[0].value == newBalance);\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2SH32(hash256(this.activeBytecode)));\r\n    }\r\n\r\n    function resolveDraw(bytes secret, sig operatorSig, bytes20 winnerPkHash) {\r\n        // Enforce absolute time lock: draw can only happen at or after drawDeadline\r\n        require(tx.time >= drawDeadline);\r\n        \r\n        require(checkSig(operatorSig, operatorPk));\r\n        require(hash160(secret) == secretHash);\r\n\r\n        bytes32 entropyHash = sha256(secret + tx.inputs[this.activeInputIndex].outpointTransactionHash);\r\n        int randomSeed = int(entropyHash);\r\n        int winningNumber = (randomSeed % maxTicketRange) + 1;\r\n\r\n        require(winningNumber > 0);\r\n\r\n        int jackpotAmount = tx.inputs[this.activeInputIndex].value;\r\n        bytes25 winnerLockingBytecode = new LockingBytecodeP2PKH(winnerPkHash);\r\n\r\n        require(tx.outputs[0].value == jackpotAmount);\r\n        require(tx.outputs[0].lockingBytecode == winnerLockingBytecode);\r\n    }\r\n\r\n    function reclaimRefund(pubkey buyerPk, sig buyerSig) {\r\n        // Enforce absolute time lock for emergency refunds\r\n        require(tx.time >= refundDeadline);\r\n        require(checkSig(buyerSig, buyerPk));\r\n    }\r\n}",
-  "fingerprint": "eead089a4a82fdc4b2917112520bcbf27c963f4caf448ca9556616596ef5e7c4",
+  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_INPUTINDEX OP_UTXOVALUE OP_2 OP_PICK OP_GREATERTHANOREQUAL OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_ROT OP_ADD OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE aa20 OP_ACTIVEBYTECODE OP_HASH256 OP_CAT 87 OP_CAT OP_EQUALVERIFY 6a14 OP_SWAP OP_CAT OP_5 OP_ROLL OP_CAT OP_1 OP_OUTPUTBYTECODE OP_EQUALVERIFY OP_1 OP_OUTPUTVALUE OP_0 OP_NUMEQUALVERIFY OP_2DROP OP_2DROP OP_1 OP_ELSE OP_4 OP_PICK OP_1 OP_NUMEQUAL OP_IF OP_6 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_6 OP_PICK OP_SIZE OP_NIP 50 OP_NUMEQUALVERIFY OP_6 OP_PICK OP_HASH256 OP_DUP OP_3 OP_SPLIT OP_DROP 000000 OP_EQUALVERIFY OP_7 OP_ROLL 44 OP_SPLIT OP_NIP OP_4 OP_SPLIT OP_DROP OP_BIN2NUM OP_5 OP_ROLL OP_GREATERTHANOREQUAL OP_VERIFY OP_BIN2NUM OP_3 OP_ROLL OP_MOD OP_1ADD OP_0 OP_GREATERTHAN OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE 76a914 OP_ROT OP_CAT 88ac OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ELSE OP_4 OP_ROLL OP_2 OP_NUMEQUALVERIFY OP_3 OP_ROLL OP_CHECKLOCKTIMEVERIFY OP_DROP OP_4 OP_ROLL OP_4 OP_PICK OP_CHECKSIGVERIFY OP_0 OP_OUTPUTBYTECODE 76a914 OP_5 OP_ROLL OP_HASH160 OP_CAT 88ac OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ENDIF OP_ENDIF",
+  "source": "pragma cashscript ^0.13.0;\r\n\r\ncontract Lottery(\r\n    int ticketPrice,\r\n    int maxTicketRange,\r\n    int drawDeadline,\r\n    int refundDeadline\r\n) {\r\n    // Anyone may buy a ticket. The buyer's identity and picked numbers are\r\n    // committed permanently and publicly via an OP_RETURN output, so the\r\n    // full ticket ledger is auditable on-chain — this used to exist only\r\n    // in the app's React state.\r\n    function buyTicket(bytes20 buyerPkHash, bytes pickedNumbers) {\r\n        require(tx.inputs[this.activeInputIndex].value >= ticketPrice);\r\n\r\n        int newBalance = tx.inputs[this.activeInputIndex].value + ticketPrice;\r\n        require(tx.outputs[0].value == newBalance);\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2SH32(hash256(this.activeBytecode)));\r\n\r\n        // OP_RETURN <buyerPkHash 20 bytes> <pickedNumbers>\r\n        bytes ticketRecord = 0x6a14 + buyerPkHash + pickedNumbers;\r\n        require(tx.outputs[1].lockingBytecode == ticketRecord);\r\n        require(tx.outputs[1].value == 0);\r\n    }\r\n\r\n    // Permissionless draw resolution. No operator, no secret, no signature\r\n    // requirement at all — anyone can submit a real 80-byte BCH block\r\n    // header once its timestamp clears drawDeadline. The contract itself\r\n    // checks the header actually did proof-of-work and derives the\r\n    // winning number from its hash. Whichever valid header gets mined\r\n    // into a transaction first wins the race and spends this UTXO — the\r\n    // same race that used to happen client-side across browser tabs is\r\n    // now settled by the chain instead of by trusting a tab's timer.\r\n    function resolveDraw(bytes header, bytes20 winnerPkHash) {\r\n        require(header.length == 80);\r\n\r\n        bytes32 blockHash = hash256(header);\r\n\r\n        // Proof-of-work floor: require the header hash to have at least\r\n        // 3 leading zero bytes. This is a simplified proxy for an exact\r\n        // nBits target comparison (full 256-bit target math isn't\r\n        // practical in-VM) — it's set comfortably below real BCH mainnet\r\n        ///chipnet difficulty, so any genuinely-mined header passes, while\r\n        // a hand-fabricated header (near-zero cost without mining) does\r\n        // not. It is NOT full SPV verification: it doesn't prove this\r\n        // header is part of the canonical chain, only that real hashing\r\n        // work went into it.\r\n        require(blockHash.split(3)[0] == 0x000000);\r\n\r\n        bytes4 timeBytes = unsafe_bytes4(header.split(68)[1].split(4)[0]);\r\n        int headerTime = int(timeBytes);\r\n        require(headerTime >= drawDeadline);\r\n\r\n        int winningNumber = (int(blockHash) % maxTicketRange) + 1;\r\n        require(winningNumber > 0);\r\n\r\n        int jackpotAmount = tx.inputs[this.activeInputIndex].value;\r\n        require(tx.outputs[0].value == jackpotAmount);\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(winnerPkHash));\r\n    }\r\n\r\n    // Hardened vs. the original: refund must pay the signer's own address,\r\n    // not an arbitrary output the spender names. Still an open limitation\r\n    // (see notes) — without per-ticket token tracking, the contract can't\r\n    // bind a refund amount to what a specific buyer actually paid in.\r\n    function reclaimRefund(pubkey buyerPk, sig buyerSig) {\r\n        require(tx.time >= refundDeadline);\r\n        require(checkSig(buyerSig, buyerPk));\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(hash160(buyerPk)));\r\n    }\r\n}\r\n",
+  "fingerprint": "71c4a9f390baea40b8238892e7e907d53832d3544441fc311b64fd974c95a6ee",
   "debug": {
-    "bytecode": "5679009c63c0c65379a269c0c6537a9300cc9d00cd02aa20c1aa7e01877e886d6d6d51675679519c63597a82011488557ab175587a7bad5679a97b88557ac0c87ea881537a978b00a069c0c60376a9147b7e0288ac7e00cc7b9d00cd8777777767567a529d557ab175567a567aad6d6d75516868",
-    "sourceMap": "11:4:20:5;;;;;13:26:13:47;:16::54:1;:58::69:0;;:16:::1;:8::71;15:39:15:60:0;:29::67:1;16:42:16:53:0;;:25:::1;18:27:18:28:0;:16::35:1;:8::51;19:27:19:28:0;:16::45:1;:49::104:0;:83::102;:75::103:1;:49::104;;;:8::106;11:25:20:5;;;;:4;22::40::0;;;;;:56:22:76;;;;;24:27:24:39;;:8::41:1;;26:25:26:36:0;;:38::48;:8::51:1;27:24:27:30:0;;:16::31:1;:35::45:0;:8::47:1;29:37:29:43:0;;:56::77;:46::102:1;:37;:30::103;30:25:30:41;31:42:31:56:0;;:29:::1;:28::61;33:32:33:33:0;:16:::1;:8::35;35:38:35:59:0;:28::66:1;36:40:36:78:0;:65::77;:40::78:1;;;38:27:38:28:0;:16::35:1;:39::52:0;:8::54:1;39:27:39:28:0;:16::45:1;:8::72;22:78:40:5;;;:4;42::46::0;;;;44:27:44:41;;:8::43:1;;45:25:45:33:0;;:35::42;;:8::45:1;42:57:46:5;;;;3:0:47:1;",
+    "bytecode": "5479009c63557a82011488c0c65279a269c0c67b9300cc9d00cd02aa20c1aa7e01877e88026a147c7e557a7e51cd8851cc009d6d6d51675479519c63567a820114885679827701509d5679aa76537f750300000088577a01447f77547f7581557aa26981537a978b00a069c0c600cc9d00cd0376a9147b7e0288ac7e8777777767547a529d537ab175547a5479ad00cd0376a914557aa97e0288ac7e877777776868",
+    "sourceMap": "13:4:24:5;;;;;:23:13:42;;;;;14:26:14:47;:16::54:1;:58::69:0;;:16:::1;:8::71;16:35:16:56:0;:25::63:1;:66::77:0;:25:::1;17:27:17:28:0;:16::35:1;:8::51;18:27:18:28:0;:16::45:1;:49::104:0;:83::102;:75::103:1;:49::104;;;:8::106;21:29:21:35:0;:38::49;:29:::1;:52::65:0;;:29:::1;22:27:22:28:0;:16::45:1;:8::63;23:27:23:28:0;:16::35:1;:39::40:0;:8::42:1;13:65:24:5;;;:4;34::60::0;;;;;:39:34:59;;;;;35:16:35:22;;:::29:1;;:33::35:0;:8::37:1;37:36:37:42:0;;:28::43:1;48:16:48:25:0;:32::33;:16::34:1;:::37;:41::49:0;:8::51:1;50:41:50:47:0;;:54::56;:41::57:1;:::60;:67::68:0;:41::69:1;:::72;51:25:51:39;52:30:52:42:0;;:16:::1;:8::44;54:29:54:43;:46::60:0;;:29:::1;:28::65;55:32:55:33:0;:16:::1;:8::35;57:38:57:59:0;:28::66:1;58:27:58:28:0;:16::35:1;:8::54;59:27:59:28:0;:16::45:1;:49::87:0;:74::86;:49::87:1;;;:8::89;34:61:60:5;;;:4;66::70::0;;;;67:27:67:41;;:8::43:1;;68:25:68:33:0;;:35::42;;:8::45:1;69:27:69:28:0;:16::45:1;:49::91:0;:82::89;;:74::90:1;:49::91;;;:8::93;66:57:70:5;;;3:0:71:1;",
     "logs": [],
     "requires": [
-      { "ip": 16, "line": 13 },
-      { "ip": 24, "line": 18 },
-      { "ip": 33, "line": 19 },
-      { "ip": 51, "line": 24 },
-      { "ip": 56, "line": 26 },
-      { "ip": 61, "line": 27 },
-      { "ip": 75, "line": 33 },
-      { "ip": 86, "line": 38 },
-      { "ip": 90, "line": 39 },
-      { "ip": 100, "line": 44 },
-      { "ip": 106, "line": 45 }
+      { "ip": 19, "line": 14 },
+      { "ip": 26, "line": 17 },
+      { "ip": 35, "line": 18 },
+      { "ip": 44, "line": 22 },
+      { "ip": 48, "line": 23 },
+      { "ip": 68, "line": 35 },
+      { "ip": 77, "line": 48 },
+      { "ip": 90, "line": 52 },
+      { "ip": 98, "line": 55 },
+      { "ip": 103, "line": 58 },
+      { "ip": 112, "line": 59 },
+      { "ip": 122, "line": 67 },
+      { "ip": 128, "line": 68 },
+      { "ip": 139, "line": 69 }
     ],
-    "sourceTags": "38:42:pv;84:86:sc"
+    "sourceTags": "5:9:pv;54:58:pv;108:110:sc;135:137:sc"
   },
   "compiler": {
     "name": "cashc",
@@ -56,5 +62,5 @@
       "enforceLocktimeGuard": true
     }
   },
-  "updatedAt": "2026-08-01T10:50:46.883Z"
+  "updatedAt": "2026-08-01T13:45:39.089Z"
 }
