@@ -1,24 +1,26 @@
 {
   "contractName": "Lottery",
   "constructorInputs": [
+    { "name": "oraclePk", "type": "pubkey" },
+    { "name": "drawTimestamp", "type": "int" },
     { "name": "ticketPrice", "type": "int" },
-    { "name": "maxTicketRange", "type": "int" },
-    { "name": "drawDeadline", "type": "int" },
-    { "name": "refundDeadline", "type": "int" }
+    { "name": "maxTicketRange", "type": "int" }
   ],
   "abi": [
     {
       "name": "buyTicket",
       "inputs": [
         { "name": "buyerPkHash", "type": "bytes20" },
-        { "name": "pickedNumbers", "type": "bytes" }
+        { "name": "pickedNumber", "type": "int" }
       ]
     },
     {
       "name": "resolveDraw",
       "inputs": [
-        { "name": "header", "type": "bytes" },
-        { "name": "winnerPkHash", "type": "bytes20" }
+        { "name": "oracleSig", "type": "datasig" },
+        { "name": "oracleMessage", "type": "bytes" },
+        { "name": "winnerPkHash", "type": "bytes20" },
+        { "name": "winningNumber", "type": "int" }
       ]
     },
     {
@@ -29,30 +31,34 @@
       ]
     }
   ],
-  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_INPUTINDEX OP_UTXOVALUE OP_2 OP_PICK OP_GREATERTHANOREQUAL OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_ROT OP_ADD OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE aa20 OP_ACTIVEBYTECODE OP_HASH256 OP_CAT 87 OP_CAT OP_EQUALVERIFY 6a14 OP_SWAP OP_CAT OP_5 OP_ROLL OP_CAT OP_1 OP_OUTPUTBYTECODE OP_EQUALVERIFY OP_1 OP_OUTPUTVALUE OP_0 OP_NUMEQUALVERIFY OP_2DROP OP_2DROP OP_1 OP_ELSE OP_4 OP_PICK OP_1 OP_NUMEQUAL OP_IF OP_6 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_6 OP_PICK OP_SIZE OP_NIP 50 OP_NUMEQUALVERIFY OP_6 OP_PICK OP_HASH256 OP_DUP OP_3 OP_SPLIT OP_DROP 000000 OP_EQUALVERIFY OP_7 OP_ROLL 44 OP_SPLIT OP_NIP OP_4 OP_SPLIT OP_DROP OP_BIN2NUM OP_5 OP_ROLL OP_GREATERTHANOREQUAL OP_VERIFY OP_BIN2NUM OP_3 OP_ROLL OP_MOD OP_1ADD OP_0 OP_GREATERTHAN OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE 76a914 OP_ROT OP_CAT 88ac OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ELSE OP_4 OP_ROLL OP_2 OP_NUMEQUALVERIFY OP_3 OP_ROLL OP_CHECKLOCKTIMEVERIFY OP_DROP OP_4 OP_ROLL OP_4 OP_PICK OP_CHECKSIGVERIFY OP_0 OP_OUTPUTBYTECODE 76a914 OP_5 OP_ROLL OP_HASH160 OP_CAT 88ac OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ENDIF OP_ENDIF",
-  "source": "pragma cashscript ^0.13.0;\r\n\r\ncontract Lottery(\r\n    int ticketPrice,\r\n    int maxTicketRange,\r\n    int drawDeadline,\r\n    int refundDeadline\r\n) {\r\n    // Anyone may buy a ticket. The buyer's identity and picked numbers are\r\n    // committed permanently and publicly via an OP_RETURN output, so the\r\n    // full ticket ledger is auditable on-chain — this used to exist only\r\n    // in the app's React state.\r\n    function buyTicket(bytes20 buyerPkHash, bytes pickedNumbers) {\r\n        require(tx.inputs[this.activeInputIndex].value >= ticketPrice);\r\n\r\n        int newBalance = tx.inputs[this.activeInputIndex].value + ticketPrice;\r\n        require(tx.outputs[0].value == newBalance);\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2SH32(hash256(this.activeBytecode)));\r\n\r\n        // OP_RETURN <buyerPkHash 20 bytes> <pickedNumbers>\r\n        bytes ticketRecord = 0x6a14 + buyerPkHash + pickedNumbers;\r\n        require(tx.outputs[1].lockingBytecode == ticketRecord);\r\n        require(tx.outputs[1].value == 0);\r\n    }\r\n\r\n    // Permissionless draw resolution. No operator, no secret, no signature\r\n    // requirement at all — anyone can submit a real 80-byte BCH block\r\n    // header once its timestamp clears drawDeadline. The contract itself\r\n    // checks the header actually did proof-of-work and derives the\r\n    // winning number from its hash. Whichever valid header gets mined\r\n    // into a transaction first wins the race and spends this UTXO — the\r\n    // same race that used to happen client-side across browser tabs is\r\n    // now settled by the chain instead of by trusting a tab's timer.\r\n    function resolveDraw(bytes header, bytes20 winnerPkHash) {\r\n        require(header.length == 80);\r\n\r\n        bytes32 blockHash = hash256(header);\r\n\r\n        // Proof-of-work floor: require the header hash to have at least\r\n        // 3 leading zero bytes. This is a simplified proxy for an exact\r\n        // nBits target comparison (full 256-bit target math isn't\r\n        // practical in-VM) — it's set comfortably below real BCH mainnet\r\n        ///chipnet difficulty, so any genuinely-mined header passes, while\r\n        // a hand-fabricated header (near-zero cost without mining) does\r\n        // not. It is NOT full SPV verification: it doesn't prove this\r\n        // header is part of the canonical chain, only that real hashing\r\n        // work went into it.\r\n        require(blockHash.split(3)[0] == 0x000000);\r\n\r\n        bytes4 timeBytes = unsafe_bytes4(header.split(68)[1].split(4)[0]);\r\n        int headerTime = int(timeBytes);\r\n        require(headerTime >= drawDeadline);\r\n\r\n        int winningNumber = (int(blockHash) % maxTicketRange) + 1;\r\n        require(winningNumber > 0);\r\n\r\n        int jackpotAmount = tx.inputs[this.activeInputIndex].value;\r\n        require(tx.outputs[0].value == jackpotAmount);\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(winnerPkHash));\r\n    }\r\n\r\n    // Hardened vs. the original: refund must pay the signer's own address,\r\n    // not an arbitrary output the spender names. Still an open limitation\r\n    // (see notes) — without per-ticket token tracking, the contract can't\r\n    // bind a refund amount to what a specific buyer actually paid in.\r\n    function reclaimRefund(pubkey buyerPk, sig buyerSig) {\r\n        require(tx.time >= refundDeadline);\r\n        require(checkSig(buyerSig, buyerPk));\r\n        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(hash160(buyerPk)));\r\n    }\r\n}\r\n",
-  "fingerprint": "71c4a9f390baea40b8238892e7e907d53832d3544441fc311b64fd974c95a6ee",
+  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_6 OP_PICK OP_0 OP_GREATERTHAN OP_7 OP_PICK OP_6 OP_ROLL OP_LESSTHANOREQUAL OP_BOOLAND OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_4 OP_ROLL OP_ADD OP_0 OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_0 OP_OUTPUTBYTECODE aa20 OP_ACTIVEBYTECODE OP_HASH256 OP_CAT 87 OP_CAT OP_EQUALVERIFY OP_1 OP_OUTPUTBYTECODE 76a914 OP_2 OP_PICK OP_CAT 88ac OP_CAT OP_EQUALVERIFY OP_1 OP_OUTPUTTOKENCOMMITMENT OP_5 OP_PICK OP_EQUALVERIFY OP_2 OP_OUTPUTVALUE OP_0 OP_NUMEQUALVERIFY OP_2 OP_OUTPUTBYTECODE 6a OP_ROT OP_SIZE OP_DUP 4b OP_GREATERTHAN OP_IF 4c OP_SWAP OP_CAT OP_ENDIF OP_SWAP OP_CAT OP_CAT OP_5 OP_ROLL OP_SIZE OP_DUP 4b OP_GREATERTHAN OP_IF 4c OP_SWAP OP_CAT OP_ENDIF OP_SWAP OP_CAT OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ELSE OP_4 OP_PICK OP_1 OP_NUMEQUAL OP_IF OP_7 OP_ROLL OP_SIZE 14 OP_EQUALVERIFY OP_ROT OP_CHECKLOCKTIMEVERIFY OP_DROP OP_5 OP_ROLL OP_6 OP_PICK OP_3 OP_ROLL OP_CHECKDATASIGVERIFY OP_4 OP_ROLL OP_5 OP_PICK OP_EQUALVERIFY OP_4 OP_PICK OP_0 OP_GREATERTHAN OP_5 OP_PICK OP_4 OP_ROLL OP_LESSTHANOREQUAL OP_BOOLAND OP_VERIFY OP_1 OP_UTXOTOKENCOMMITMENT OP_4 OP_ROLL OP_EQUALVERIFY OP_INPUTINDEX OP_UTXOVALUE OP_0 OP_OUTPUTBYTECODE 76a914 OP_3 OP_ROLL OP_CAT 88ac OP_CAT OP_EQUALVERIFY OP_0 OP_OUTPUTVALUE OP_OVER OP_LESSTHANOREQUAL OP_VERIFY OP_0 OP_OUTPUTVALUE OP_SWAP e803 OP_SUB OP_GREATERTHANOREQUAL OP_NIP OP_NIP OP_ELSE OP_4 OP_ROLL OP_2 OP_NUMEQUALVERIFY OP_SWAP 803a09 OP_ADD OP_CHECKLOCKTIMEVERIFY OP_DROP OP_4 OP_ROLL OP_4 OP_PICK OP_CHECKSIGVERIFY OP_0 OP_OUTPUTBYTECODE 76a914 OP_5 OP_ROLL OP_HASH160 OP_CAT 88ac OP_CAT OP_EQUAL OP_NIP OP_NIP OP_NIP OP_ENDIF OP_ENDIF",
+  "source": "pragma cashscript ^0.13.0;\r\n\r\n/**\r\n * Complete & Secure CashToken Lottery Contract\r\n *\r\n * Core Mechanics:\r\n * 1. buyTicket: Mints an NFT CashToken to the buyer containing their 'pickedNumber'.\r\n * 2. resolveDraw: Validates the Oracle's winning number AND requires input[1] to be \r\n *    the winning CashToken matching the winning number commitment.\r\n * 3. reclaimRefund: Allows players to reclaim funds via timelock fallback.\r\n */\r\ncontract Lottery(\r\n    pubkey oraclePk,          // Auditable Oracle Public Key\r\n    int drawTimestamp,        // Timestamp when draw opens\r\n    int ticketPrice,          // Price per ticket in Satoshis\r\n    int maxTicketRange        // Max allowed number choice (e.g., 100)\r\n) {\r\n\r\n    /**\r\n     * 1. BUY TICKET (Mints CashToken representing the entry choice)\r\n     *\r\n     * Outputs:\r\n     * 0 - Contract continuation (UTXO balance + ticketPrice)\r\n     * 1 - Buyer's Ticket: 1 NFT containing pickedNumber in token Commitment\r\n     * 2 - OP_RETURN audit log\r\n     */\r\n    function buyTicket(\r\n        bytes20 buyerPkHash,\r\n        int pickedNumber\r\n    ) {\r\n        // Enforce ticket choice range\r\n        require(pickedNumber > 0 && pickedNumber <= maxTicketRange);\r\n\r\n        // Fetch current jackpot balance\r\n        int jackpot = tx.inputs[this.activeInputIndex].value;\r\n\r\n        // Output 0: Return updated contract balance (Jackpot + Ticket Price)\r\n        int newJackpot = jackpot + ticketPrice;\r\n        require(tx.outputs[0].value == newJackpot);\r\n\r\n        // Re-bind exact contract logic (P2SH32 Covenant)\r\n        require(\r\n            tx.outputs[0].lockingBytecode ==\r\n            new LockingBytecodeP2SH32(hash256(this.activeBytecode))\r\n        );\r\n\r\n        // Output 1: Send Ticket Token (NFT) to Buyer\r\n        // Lock to Buyer's P2PKH address\r\n        require(\r\n            tx.outputs[1].lockingBytecode ==\r\n            new LockingBytecodeP2PKH(buyerPkHash)\r\n        );\r\n\r\n        // Token Introspection: Enforce NFT commitment equals bytes(pickedNumber)\r\n        require(tx.outputs[1].nftCommitment == bytes(pickedNumber));\r\n\r\n        // Output 2: Immutable On-Chain Audit Log\r\n        require(tx.outputs[2].value == 0);\r\n        require(\r\n            tx.outputs[2].lockingBytecode ==\r\n            new LockingBytecodeNullData([buyerPkHash, bytes(pickedNumber)])\r\n        );\r\n    }\r\n\r\n    /**\r\n     * 2. RESOLVE DRAW (Requires Winner to spend/burn their Winning Ticket Token)\r\n     *\r\n     * Inputs:\r\n     * 0 - Contract Jackpot UTXO\r\n     * 1 - Winner's Ticket NFT UTXO (proves ownership of winning number)\r\n     *\r\n     * Outputs:\r\n     * 0 - Entire Jackpot paid out to Winner's P2PKH address\r\n     */\r\n    function resolveDraw(\r\n        datasig oracleSig,\r\n        bytes oracleMessage,    // Encoded winning number signed by Oracle\r\n        bytes20 winnerPkHash,\r\n        int winningNumber\r\n    ) {\r\n        // 1. Time-lock check: Ensures draw happens on/after drawTimestamp\r\n        require(tx.time >= drawTimestamp);\r\n\r\n        // 2. Validate Oracle's data signature\r\n        require(checkDataSig(oracleSig, oracleMessage, oraclePk));\r\n        require(oracleMessage == bytes(winningNumber));\r\n        require(winningNumber > 0 && winningNumber <= maxTicketRange);\r\n\r\n        // 3. CASHTOKEN WINNER PROOF: Input[1] MUST be the winning ticket token\r\n        // Verify that Input[1] commitment matches the winning number\r\n        require(tx.inputs[1].nftCommitment == bytes(winningNumber));\r\n\r\n        // 4. PAYOUT JACKPOT\r\n        int jackpot = tx.inputs[this.activeInputIndex].value;\r\n\r\n        // Send payout directly to winner\r\n        require(\r\n            tx.outputs[0].lockingBytecode ==\r\n            new LockingBytecodeP2PKH(winnerPkHash)\r\n        );\r\n\r\n        // Allow up to 1,000 satoshis for miner transaction fees\r\n        require(tx.outputs[0].value <= jackpot);\r\n        require(tx.outputs[0].value >= jackpot - 1000);\r\n    }\r\n\r\n    /**\r\n     * 3. EMERGENCY REFUND\r\n     * \r\n     * Allows ticket holders to reclaim funds if the Oracle fails \r\n     * to resolve the draw within 7 days.\r\n     */\r\n    function reclaimRefund(\r\n        pubkey buyerPk,\r\n        sig buyerSig\r\n    ) {\r\n        // Timelock: Active only after 7 days (604,800 seconds) post-drawTimestamp\r\n        require(tx.time >= drawTimestamp + 604800);\r\n\r\n        // Validate claimant signature\r\n        require(checkSig(buyerSig, buyerPk));\r\n\r\n        // Refund output directly back to claimant P2PKH address\r\n        require(\r\n            tx.outputs[0].lockingBytecode ==\r\n            new LockingBytecodeP2PKH(hash160(buyerPk))\r\n        );\r\n    }\r\n}",
+  "fingerprint": "0ad198b1505017bc0101b21857620d5f416cb7913e9cdbf1720b6dc9f5e90834",
   "debug": {
-    "bytecode": "5479009c63557a82011488c0c65279a269c0c67b9300cc9d00cd02aa20c1aa7e01877e88026a147c7e557a7e51cd8851cc009d6d6d51675479519c63567a820114885679827701509d5679aa76537f750300000088577a01447f77547f7581557aa26981537a978b00a069c0c600cc9d00cd0376a9147b7e0288ac7e8777777767547a529d537ab175547a5479ad00cd0376a914557aa97e0288ac7e877777776868",
-    "sourceMap": "13:4:24:5;;;;;:23:13:42;;;;;14:26:14:47;:16::54:1;:58::69:0;;:16:::1;:8::71;16:35:16:56:0;:25::63:1;:66::77:0;:25:::1;17:27:17:28:0;:16::35:1;:8::51;18:27:18:28:0;:16::45:1;:49::104:0;:83::102;:75::103:1;:49::104;;;:8::106;21:29:21:35:0;:38::49;:29:::1;:52::65:0;;:29:::1;22:27:22:28:0;:16::45:1;:8::63;23:27:23:28:0;:16::35:1;:39::40:0;:8::42:1;13:65:24:5;;;:4;34::60::0;;;;;:39:34:59;;;;;35:16:35:22;;:::29:1;;:33::35:0;:8::37:1;37:36:37:42:0;;:28::43:1;48:16:48:25:0;:32::33;:16::34:1;:::37;:41::49:0;:8::51:1;50:41:50:47:0;;:54::56;:41::57:1;:::60;:67::68:0;:41::69:1;:::72;51:25:51:39;52:30:52:42:0;;:16:::1;:8::44;54:29:54:43;:46::60:0;;:29:::1;:28::65;55:32:55:33:0;:16:::1;:8::35;57:38:57:59:0;:28::66:1;58:27:58:28:0;:16::35:1;:8::54;59:27:59:28:0;:16::45:1;:49::87:0;:74::86;:49::87:1;;;:8::89;34:61:60:5;;;:4;66::70::0;;;;67:27:67:41;;:8::43:1;;68:25:68:33:0;;:35::42;;:8::45:1;69:27:69:28:0;:16::45:1;:49::91:0;:82::89;;:74::90:1;:49::91;;;:8::93;66:57:70:5;;;3:0:71:1;",
+    "bytecode": "5479009c63557a82011488567900a05779567aa19a69c0c6547a9300cc9d00cd02aa20c1aa7e01877e8851cd0376a91452797e0288ac7e8851d255798852cc009d52cd016a7b8276014ba063014c7c7e687c7e7e557a8276014ba063014c7c7e687c7e7e87777777675479519c63577a820114887bb175557a5679537abb547a557988547900a05579547aa19a6951cf547a88c0c600cd0376a914537a7e0288ac7e8800cc78a16900cc7c02e80394a2777767547a529d7c03803a0993b175547a5479ad00cd0376a914557aa97e0288ac7e877777776868",
+    "sourceMap": "27:4:63:5;;;;;28:8:28:27;;;;;32:16:32:28;;:31::32;:16:::1;:36::48:0;;:52::66;;:36:::1;:16;:8::68;35:32:35:53:0;:22::60:1;38:35:38:46:0;;:25:::1;39:27:39:28:0;:16::35:1;:8::51;43:23:43:24:0;:12::41:1;44::44:67:0;:46::65;:38::66:1;:12::67;;;42:8:45:10;50:23:50:24:0;:12::41:1;51::51:49:0;:37::48;;:12::49:1;;;49:8:52:10;55:27:55:28:0;:16::43:1;:53::65:0;;:8::68:1;58:27:58:28:0;:16::35:1;:39::40:0;:8::42:1;60:23:60:24:0;:12::41:1;61::61:75:0;:41::52;::::1;;;;;;;;;;;;:60::72:0;;:54::73:1;;;;;;;;;;;;59:8:62:10;30:6:63:5;;;27:4;75::105::0;;;;;78:8:78:28;;;;;82:27:82:40;:8::42:1;;85:29:85:38:0;;:40::53;;:55::63;;:8::66:1;86:16:86:29:0;;:39::52;;:8::55:1;87:16:87:29:0;;:32::33;:16:::1;:37::50:0;;:54::68;;:37:::1;:16;:8::70;91:26:91:27:0;:16::42:1;:52::65:0;;:8::68:1;94:32:94:53:0;:22::60:1;98:23:98:24:0;:12::41:1;99::99:50:0;:37::49;;:12::50:1;;;97:8:100:10;103:27:103:28:0;:16::35:1;:39::46:0;:16:::1;:8::48;104:27:104:28:0;:16::35:1;:39::46:0;:49::53;:39:::1;:8::55;80:6:105:5;;75:4;113::128::0;;;;118:27:118:40;:43::49;:27:::1;:8::51;;121:25:121:33:0;;:35::42;;:8::45:1;125:23:125:24:0;:12::41:1;126::126:54:0;:45::52;;:37::53:1;:12::54;;;124:8:127:10;116:6:128:5;;;12:0:129:1;",
     "logs": [],
     "requires": [
-      { "ip": 19, "line": 14 },
-      { "ip": 26, "line": 17 },
-      { "ip": 35, "line": 18 },
-      { "ip": 44, "line": 22 },
-      { "ip": 48, "line": 23 },
-      { "ip": 68, "line": 35 },
-      { "ip": 77, "line": 48 },
-      { "ip": 90, "line": 52 },
-      { "ip": 98, "line": 55 },
-      { "ip": 103, "line": 58 },
-      { "ip": 112, "line": 59 },
-      { "ip": 122, "line": 67 },
-      { "ip": 128, "line": 68 },
-      { "ip": 139, "line": 69 }
+      { "ip": 24, "line": 32 },
+      { "ip": 32, "line": 39 },
+      { "ip": 41, "line": 42 },
+      { "ip": 50, "line": 49 },
+      { "ip": 55, "line": 55 },
+      { "ip": 59, "line": 58 },
+      { "ip": 91, "line": 59 },
+      { "ip": 106, "line": 82 },
+      { "ip": 114, "line": 85 },
+      { "ip": 119, "line": 86 },
+      { "ip": 130, "line": 87 },
+      { "ip": 135, "line": 91 },
+      { "ip": 146, "line": 97 },
+      { "ip": 151, "line": 103 },
+      { "ip": 158, "line": 104 },
+      { "ip": 168, "line": 118 },
+      { "ip": 174, "line": 121 },
+      { "ip": 185, "line": 124 }
     ],
-    "sourceTags": "5:9:pv;54:58:pv;108:110:sc;135:137:sc"
+    "sourceTags": "5:9:pv;87:89:sc;96:100:pv;154:155:sc;181:183:sc"
   },
   "compiler": {
     "name": "cashc",
@@ -62,5 +68,5 @@
       "enforceLocktimeGuard": true
     }
   },
-  "updatedAt": "2026-08-01T13:45:39.089Z"
+  "updatedAt": "2026-08-01T15:53:00.268Z"
 }

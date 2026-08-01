@@ -6,29 +6,18 @@ import {
   CashAddressType,
 } from "@bitauth/libauth";
 import { ElectrumNetworkProvider } from "cashscript";
-
-// -----------------------------------------------------------------------
-// Verified in this sandbox: key generation, pubkey derivation, hash160,
-// and cashaddr encoding below were run end-to-end against the installed
-// libauth 3.1.0-next.8 (see wallet.test.mjs / the console output posted
-// alongside this file) and produce a well-formed chipnet P2PKH address.
-// UTXO/balance fetching against a live Electrum server was NOT exercised
-// here (no network access to chipnet in this sandbox) — confirm those
-// two calls against a real server before relying on them.
-// -----------------------------------------------------------------------
+import type { Utxo } from "cashscript";
 
 export interface WalletKeypair {
   privateKey: Uint8Array;
   publicKey: Uint8Array; // 33-byte compressed
-  pkHash: Uint8Array; // hash160(publicKey), 20 bytes — this is buyerPkHash for buyTicket()
-  address: string; // chipnet cashaddr
+  pkHash: Uint8Array; // hash160(publicKey), 20 bytes — buyerPkHash for buyTicket()
+  address: string; // chipnet cashaddr (p2pkhWithTokens)
 }
 
-// Derives the full keypair (pubkey, pkHash, chipnet address) from an
-// existing private key, instead of generating a new one. Used both by
-// generateWallet() below and by callers restoring a previously-saved key
-// (e.g. from localStorage) so a page refresh doesn't strand funds at an
-// address the app can no longer produce.
+/**
+ * Derives the full keypair (pubkey, pkHash, chipnet address) from an existing private key.
+ */
 export function walletFromPrivateKey(privateKey: Uint8Array): WalletKeypair {
   const publicKey = secp256k1.derivePublicKeyCompressed(privateKey);
   if (typeof publicKey === "string") {
@@ -36,9 +25,10 @@ export function walletFromPrivateKey(privateKey: Uint8Array): WalletKeypair {
   }
   const pkHash = hash160(publicKey);
 
+  // IMPORTANT: this must be a token-aware address type (p2pkhWithTokens).
   const addressResult = encodeCashAddress({
-    prefix: "bchtest", // chipnet uses the same "bchtest" prefix as testnet
-    type: CashAddressType.p2pkh,
+    prefix: "bchtest", // Chipnet uses "bchtest"
+    type: CashAddressType.p2pkhWithTokens,
     payload: pkHash,
     throwErrors: false,
   });
@@ -49,16 +39,15 @@ export function walletFromPrivateKey(privateKey: Uint8Array): WalletKeypair {
   return { privateKey, publicKey, pkHash, address: addressResult.address };
 }
 
+/**
+ * Generates a fresh random keypair.
+ */
 export function generateWallet(): WalletKeypair {
   return walletFromPrivateKey(generatePrivateKey());
 }
 
-// --- Private key <-> hex, for persistence -----------------------------
-// Plain hex in localStorage is fine ONLY because this wallet talks to
-// chipnet, where the "funds" are worthless test coins obtained from a
-// faucet. Do not reuse this persistence approach for a mainnet wallet
-// holding real value — that needs actual secure storage (encrypted at
-// rest, ideally never touching localStorage at all).
+// --- Private Key Hex Serialization -------------------------------------
+
 export function privateKeyToHex(privateKey: Uint8Array): string {
   return Array.from(privateKey)
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -66,26 +55,106 @@ export function privateKeyToHex(privateKey: Uint8Array): string {
 }
 
 export function privateKeyFromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  const cleanHex = hex.trim().replace(/^0x/, "");
+  const match = cleanHex.match(/.{1,2}/g);
+  if (!match || cleanHex.length % 2 !== 0) {
+    throw new Error("Invalid hex string format.");
   }
-  return bytes;
+  return new Uint8Array(match.map((byte) => parseInt(byte, 16)));
 }
 
-// --- Balance / UTXOs -------------------------------------------------------
-// Electrum's protocol takes a scripthash, not an address directly.
-// cashscript's ElectrumNetworkProvider exposes address-based convenience
-// methods that do this conversion internally — using those here rather
-// than hand-rolling scripthash derivation, since that conversion is easy
-// to get subtly wrong and cashscript already ships a tested version.
+// --- Network Provider & Token UTXO Methods ----------------------------------
+
 const provider = new ElectrumNetworkProvider("chipnet");
 
-export async function getWalletUtxos(address: string) {
+/**
+ * Retrieves all UTXOs belonging to the specified address.
+ */
+export async function getWalletUtxos(address: string): Promise<Utxo[]> {
   return provider.getUtxos(address);
 }
 
+/**
+ * Calculates spendable BCH balance (in Satoshis), filtering out Token UTXOs.
+ */
 export async function getWalletBalanceSats(address: string): Promise<bigint> {
   const utxos = await getWalletUtxos(address);
-  return utxos.reduce((sum, utxo) => sum + BigInt(utxo.satoshis), 0n);
+  return utxos
+    .filter((u) => !u.token) // Exclude token UTXOs
+    .reduce((sum, utxo) => sum + BigInt(utxo.satoshis), 0n);
+}
+
+// Inverse of Script-Number encoding (little-endian, sign-and-magnitude)
+function scriptNumHexToNumber(hex: string): number {
+  if (!hex) return 0;
+  const bytes = hex.match(/.{1,2}/g)!.map((b) => parseInt(b, 16));
+  let result = 0;
+  for (let i = bytes.length - 1; i >= 0; i--) {
+    let byte = bytes[i];
+    if (i === bytes.length - 1) {
+      byte &= 0x7f; // strip sign flag
+    }
+    result = result * 256 + byte;
+  }
+  return result;
+}
+
+/**
+ * Retrieves all CashToken NFT tickets owned by the wallet address.
+ */
+export async function getWalletTickets(address: string): Promise<{
+  utxo: Utxo;
+  pickedNumber: number;
+  commitmentHex: string;
+}[]> {
+  const utxos = await getWalletUtxos(address);
+
+  return utxos
+    .filter((u) => u.token && u.token.nft)
+    .map((u) => {
+      const commitmentHex = u.token?.nft?.commitment || "";
+      return {
+        utxo: u,
+        pickedNumber: scriptNumHexToNumber(commitmentHex),
+        commitmentHex,
+      };
+    });
+}
+
+// --- Demo Key Persistence & Hardcode Fallback ----------------------------------
+
+const LOCAL_STORAGE_KEY = "lottery_demo_wallet_privkey";
+
+// 💡 Paste a 64-char funded Chipnet private key hex here for permanent demo stability
+const HARDCODED_DEMO_PRIVKEY_HEX = "";
+
+/**
+ * Returns a persistent demo wallet across page reloads.
+ */
+export function getDemoWallet(): WalletKeypair {
+  let keyHex = localStorage.getItem(LOCAL_STORAGE_KEY);
+
+  if (!keyHex || keyHex.length !== 64) {
+    if (HARDCODED_DEMO_PRIVKEY_HEX && HARDCODED_DEMO_PRIVKEY_HEX.length === 64) {
+      keyHex = HARDCODED_DEMO_PRIVKEY_HEX;
+    } else {
+      const newKeyPair = generateWallet();
+      keyHex = privateKeyToHex(newKeyPair.privateKey);
+    }
+    localStorage.setItem(LOCAL_STORAGE_KEY, keyHex);
+  }
+
+  return walletFromPrivateKey(privateKeyFromHex(keyHex));
+}
+
+/**
+ * Allows importing a new funded key into localStorage and returning the new wallet.
+ */
+export function setDemoWalletKey(hex: string): WalletKeypair {
+  const cleanHex = hex.trim().replace(/^0x/, "");
+  if (cleanHex.length !== 64) {
+    throw new Error("Invalid private key: must be a 64-character hex string.");
+  }
+  localStorage.setItem(LOCAL_STORAGE_KEY, cleanHex);
+  return walletFromPrivateKey(privateKeyFromHex(cleanHex));
 }

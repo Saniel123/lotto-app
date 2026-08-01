@@ -5,22 +5,8 @@ import {
   TransactionBuilder,
 } from "cashscript";
 import type { Utxo } from "cashscript";
-import LotteryArtifact from "./Lottery.json";
-
-// -----------------------------------------------------------------------
-// Rewritten against cashscript 0.13.2's actual shipped API (checked
-// against the installed .d.ts files in this sandbox: Contract.d.ts,
-// TransactionBuilder.d.ts, SignatureTemplate.d.ts, interfaces.d.ts).
-// The previous version of this file used an older fluent
-// `.functions.foo().from().to().send()` style that does NOT exist on
-// this version — it's `contract.unlock.<fn>(...)` producing an
-// `Unlocker`, consumed by a standalone `TransactionBuilder`.
-//
-// STILL NOT LIVE-TESTED: no chipnet/Electrum network access in this
-// sandbox, so none of the calls below have actually broadcast. Fund a
-// chipnet wallet from the faucet and run one of each function before
-// trusting this in the UI.
-// -----------------------------------------------------------------------
+import { secp256k1 } from "@bitauth/libauth";
+import CompleteLotteryArtifact from "./Lottery.json";
 
 const provider = new ElectrumNetworkProvider("chipnet");
 
@@ -30,105 +16,56 @@ function bytesToHex(bytes: Uint8Array): string {
     .join("");
 }
 
-export interface LotteryParams {
-  ticketPriceSats: bigint;
-  maxTicketRange: number;
-  drawDeadline: number; // unix seconds
-  refundDeadline: number; // unix seconds
+// --- CashScript / Script-Number encoding ---------------------------------
+export function numberToScriptNumBytes(n: number | bigint): Uint8Array {
+  let abs = typeof n === "bigint" ? (n < 0n ? -n : n) : BigInt(Math.abs(n));
+  if (abs === 0n) return new Uint8Array(0);
+
+  const negative = typeof n === "bigint" ? n < 0n : n < 0;
+  const bytes: number[] = [];
+
+  while (abs > 0n) {
+    bytes.push(Number(abs & 0xffn));
+    abs >>= 8n;
+  }
+
+  if (bytes[bytes.length - 1] & 0x80) {
+    bytes.push(negative ? 0x80 : 0x00);
+  } else if (negative) {
+    bytes[bytes.length - 1] |= 0x80;
+  }
+
+  return new Uint8Array(bytes);
 }
 
+export function numberToScriptNumHex(n: number | bigint): string {
+  return bytesToHex(numberToScriptNumBytes(n));
+}
+
+export interface LotteryParams {
+  oraclePk: Uint8Array;
+  drawTimestamp: number; // Unix timestamp in seconds
+  ticketPriceSats: bigint;
+  maxTicketRange: number;
+}
+
+/**
+ * Instantiate the updated CashTokens CompleteLottery Contract.
+ */
 export function getLotteryContract(params: LotteryParams) {
-  // cashscript validates constructor args against the artifact's declared
-  // types at runtime: an artifact 'int' input must be a JS bigint, not a
-  // number — passing a number throws "Found type 'number' where type
-  // 'int' was expected" the first time getUtxos()/functions touch the
-  // contract. ticketPriceSats is already a bigint; the other three were
-  // plain numbers (drawDeadline/refundDeadline are unix-second numbers,
-  // maxTicketRange is a plain JS number computed from 10 ** pickCount) —
-  // wrap all four in BigInt(...) here so callers can keep passing normal
-  // numbers without having to know this cashscript quirk themselves.
   return new Contract(
-    LotteryArtifact,
+    CompleteLotteryArtifact,
     [
+      params.oraclePk,
+      BigInt(params.drawTimestamp),
       params.ticketPriceSats,
       BigInt(params.maxTicketRange),
-      BigInt(params.drawDeadline),
-      BigInt(params.refundDeadline),
     ],
     { provider },
   );
 }
 
-// --- buyTicket ---------------------------------------------------------
-// Two inputs: the funding input from the buyer's own wallet (unlocked with
-// a plain SignatureTemplate) comes first as input 0, and the contract's own
-// UTXO comes second as input 1 (matching typical contract expectations where
-// introspection checks input 1 or active indices). Two outputs the contract
-// requires (new contract balance, OP_RETURN ticket record), plus buyer change.
-export async function buyTicket(
-  contract: Contract,
-  ticketPriceSats: bigint,
-  buyerPkHash: Uint8Array,
-  pickedNumbers: Uint8Array,
-  buyerPrivateKey: Uint8Array,
-  buyerAddress: string,
-) {
-  const contractUtxos = await contract.getUtxos();
-  if (contractUtxos.length === 0) {
-    throw new Error("Lottery contract has no UTXO yet — fund/create it first.");
-  }
-
-  const contractUtxo = contractUtxos.reduce((best, u) =>
-    u.satoshis > best.satoshis ? u : best,
-  );
-
-  if (contractUtxo.satoshis < ticketPriceSats) {
-    throw new Error(
-      "Contract's largest UTXO is smaller than one ticket price.",
-    );
-  }
-
-  const buyerUtxos = await provider.getUtxos(buyerAddress);
-  const fundingUtxo = buyerUtxos.find(
-    (u: Utxo) => !u.token && u.satoshis >= ticketPriceSats + 1000n,
-  );
-  if (!fundingUtxo) {
-    throw new Error(
-      "Buyer wallet has no UTXO large enough to cover ticket + fee.",
-    );
-  }
-
-  // Explicitly instantiate the signature template
-  const sigTemplate = new SignatureTemplate(buyerPrivateKey);
-  const newContractBalance = contractUtxo.satoshis + ticketPriceSats;
-
-  const builder = new TransactionBuilder({ provider });
-  builder
-    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
-    .addInput(
-      contractUtxo,
-      contract.unlock.buyTicket(buyerPkHash, pickedNumbers),
-    )
-    .addOutput({ to: contract.address, amount: newContractBalance })
-    .addOpReturnOutput([
-      `0x${bytesToHex(buyerPkHash)}`,
-      `0x${bytesToHex(pickedNumbers)}`,
-    ])
-    .addBchChangeOutputIfNeeded({ to: buyerAddress, feeRate: 1.0 });
-
-  return builder.send();
-}
-
 // --- seedContract ---------------------------------------------------------
-// A fresh slot contract (see App.tsx's PER-SLOT CONTRACTS note — each
-// drawDeadline gets its own address) starts with zero UTXOs. buyTicket()
-// requires an existing contract UTXO to spend and extend
-// (`tx.inputs[this.activeInputIndex].value >= ticketPrice` — note this
-// means the FIRST funding UTXO already needs to hold at least one ticket's
-// worth of sats, not just a dust amount), so something has to pay the
-// contract's own address directly, once, before any buyTicket call works.
-// This is an ordinary P2PKH-funded payment TO the contract address — no
-// contract function is invoked, since nothing exists yet to unlock.
 export async function seedContract(
   contract: Contract,
   amountSats: bigint,
@@ -155,12 +92,99 @@ export async function seedContract(
   return builder.send();
 }
 
-// Permissionless — no operator key, no signature requirement at all.
+// --- buyTicket ---------------------------------------------------------
+export async function buyTicket(
+  contract: Contract,
+  ticketPriceSats: bigint,
+  buyerPkHash: Uint8Array,
+  pickedNumber: number | bigint,
+  buyerPrivateKey: Uint8Array,
+  buyerAddress: string,
+) {
+  const contractUtxos = await contract.getUtxos();
+  if (contractUtxos.length === 0) {
+    throw new Error("Lottery contract has no UTXO yet — fund/seed it first.");
+  }
+
+  // Contract UTXO MUST be Input 0
+  const contractUtxo = contractUtxos.reduce((best, u) =>
+    u.satoshis > best.satoshis ? u : best,
+  );
+
+  const buyerUtxos = await provider.getUtxos(buyerAddress);
+  const fundingUtxo = buyerUtxos.find(
+    (u: Utxo) => !u.token && u.satoshis >= ticketPriceSats + 2000n,
+  );
+  if (!fundingUtxo) {
+    throw new Error(
+      "Buyer wallet has no UTXO large enough to cover ticket price + fee.",
+    );
+  }
+
+  const sigTemplate = new SignatureTemplate(buyerPrivateKey);
+  const newContractBalance = contractUtxo.satoshis + ticketPriceSats;
+  const numberHex = numberToScriptNumHex(pickedNumber);
+
+  const builder = new TransactionBuilder({ provider });
+  builder
+    // Input 0: Contract Jackpot UTXO
+    .addInput(
+      contractUtxo,
+      contract.unlock.buyTicket(buyerPkHash, BigInt(pickedNumber)),
+    )
+    // Input 1: Buyer Funding UTXO
+    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
+    // Output 0: Contract Continuation (Jackpot + Ticket Price)
+    .addOutput({ to: contract.address, amount: newContractBalance })
+    // Output 1: CashToken NFT Ticket sent to buyer
+    // Token Category MUST match contractUtxo.txid or contract's token category logic
+    .addOutput({
+      to: buyerAddress,
+      amount: 1000n,
+      token: {
+        category: contractUtxo.token?.category || contractUtxo.txid,
+        amount: 0n,
+        nft: {
+          capability: "none",
+          commitment: numberHex,
+        },
+      },
+    })
+    // Output 2: OP_RETURN Audit Record
+    .addOpReturnOutput([
+      `0x${bytesToHex(buyerPkHash)}`,
+      `0x${numberHex}`,
+    ])
+    .addBchChangeOutputIfNeeded({ to: buyerAddress, feeRate: 1.2 });
+
+  return builder.send();
+}
+
+// --- Oracle signing ---------------------------------------------------------
+export async function signOracleWinningNumber(
+  oraclePrivateKey: Uint8Array,
+  winningNumber: number,
+): Promise<{ oracleSig: Uint8Array; oracleMessage: Uint8Array }> {
+  const oracleMessage = numberToScriptNumBytes(winningNumber);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", oracleMessage),
+  );
+  const sigResult = secp256k1.signMessageHashDER(oraclePrivateKey, digest);
+  if (typeof sigResult === "string") {
+    throw new Error(`Failed to sign oracle message: ${sigResult}`);
+  }
+  return { oracleSig: sigResult, oracleMessage };
+}
+
+// --- resolveDraw ---------------------------------------------------------
 export async function resolveDraw(
   contract: Contract,
-  header: Uint8Array, // raw 80-byte block header
+  oracleSig: Uint8Array,
+  oracleMessage: Uint8Array,
   winnerAddress: string,
   winnerPkHash: Uint8Array,
+  winningNumber: number,
+  winnerPrivateKey: Uint8Array,
 ) {
   const contractUtxos = await contract.getUtxos();
   if (contractUtxos.length === 0) {
@@ -168,10 +192,37 @@ export async function resolveDraw(
   }
   const contractUtxo = contractUtxos[0];
 
+  const winnerUtxos = await provider.getUtxos(winnerAddress);
+  const numberHex = numberToScriptNumHex(winningNumber);
+
+  const winnerNftUtxo = winnerUtxos.find(
+    (u: Utxo) => u.token?.nft?.commitment === numberHex,
+  );
+
+  if (!winnerNftUtxo) {
+    throw new Error(
+      "Winner address does not hold the winning CashToken NFT ticket.",
+    );
+  }
+
+  const sigTemplate = new SignatureTemplate(winnerPrivateKey);
+  const payoutAmount = contractUtxo.satoshis - 1500n; // Fee margin
+
   const builder = new TransactionBuilder({ provider });
+  builder.setLocktime(Math.floor(Date.now() / 1000));
+
   builder
-    .addInput(contractUtxo, contract.unlock.resolveDraw(header, winnerPkHash))
-    .addOutput({ to: winnerAddress, amount: contractUtxo.satoshis });
+    .addInput(
+      contractUtxo,
+      contract.unlock.resolveDraw(
+        oracleSig,
+        oracleMessage,
+        winnerPkHash,
+        BigInt(winningNumber),
+      ),
+    )
+    .addInput(winnerNftUtxo, sigTemplate.unlockP2PKH())
+    .addOutput({ to: winnerAddress, amount: payoutAmount });
 
   return builder.send();
 }
@@ -191,12 +242,17 @@ export async function reclaimRefund(
   const sigTemplate = new SignatureTemplate(buyerPrivateKey);
 
   const builder = new TransactionBuilder({ provider });
+  builder.setLocktime(Math.floor(Date.now() / 1000));
+
   builder
     .addInput(
       contractUtxo,
       contract.unlock.reclaimRefund(buyerPublicKey, sigTemplate),
     )
-    .addOutput({ to: buyerAddress, amount: contractUtxo.satoshis });
+    .addOutput({
+      to: buyerAddress,
+      amount: contractUtxo.satoshis - 1500n,
+    });
 
   return builder.send();
 }

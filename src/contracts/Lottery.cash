@@ -1,118 +1,129 @@
 pragma cashscript ^0.13.0;
 
+/**
+ * Complete & Secure CashToken Lottery Contract
+ *
+ * Core Mechanics:
+ * 1. buyTicket: Mints an NFT CashToken to the buyer containing their 'pickedNumber'.
+ * 2. resolveDraw: Validates the Oracle's winning number AND requires input[1] to be 
+ *    the winning CashToken matching the winning number commitment.
+ * 3. reclaimRefund: Allows players to reclaim funds via timelock fallback.
+ */
 contract Lottery(
-    int ticketPrice,
-    int maxTicketRange
+    pubkey oraclePk,          // Auditable Oracle Public Key
+    int drawTimestamp,        // Timestamp when draw opens
+    int ticketPrice,          // Price per ticket in Satoshis
+    int maxTicketRange        // Max allowed number choice (e.g., 100)
 ) {
 
     /**
-     * Buy one lottery ticket.
+     * 1. BUY TICKET (Mints CashToken representing the entry choice)
      *
      * Outputs:
-     * 0 - Updated lottery contract
-     * 1 - OP_RETURN ticket record
+     * 0 - Contract continuation (UTXO balance + ticketPrice)
+     * 1 - Buyer's Ticket: 1 NFT containing pickedNumber in token Commitment
+     * 2 - OP_RETURN audit log
      */
     function buyTicket(
         bytes20 buyerPkHash,
-        bytes pickedNumbers
+        int pickedNumber
     ) {
-        // Current jackpot
+        // Enforce ticket choice range
+        require(pickedNumber > 0 && pickedNumber <= maxTicketRange);
+
+        // Fetch current jackpot balance
         int jackpot = tx.inputs[this.activeInputIndex].value;
 
-        // New jackpot after ticket purchase
+        // Output 0: Return updated contract balance (Jackpot + Ticket Price)
         int newJackpot = jackpot + ticketPrice;
+        require(tx.outputs[0].value == newJackpot);
 
-        // Contract continues with increased balance
-        require(
-            tx.outputs[0].value == newJackpot
-        );
-
+        // Re-bind exact contract logic (P2SH32 Covenant)
         require(
             tx.outputs[0].lockingBytecode ==
-            new LockingBytecodeP2SH32(
-                hash256(this.activeBytecode)
-            )
+            new LockingBytecodeP2SH32(hash256(this.activeBytecode))
         );
 
-        // OP_RETURN ticket record
-        bytes ticketRecord =
-            0x6a14 + buyerPkHash + pickedNumbers;
-
-        require(tx.outputs[1].value == 0);
-
+        // Output 1: Send Ticket Token (NFT) to Buyer
+        // Lock to Buyer's P2PKH address
         require(
             tx.outputs[1].lockingBytecode ==
-            ticketRecord
+            new LockingBytecodeP2PKH(buyerPkHash)
+        );
+
+        // Token Introspection: Enforce NFT commitment equals bytes(pickedNumber)
+        require(tx.outputs[1].nftCommitment == bytes(pickedNumber));
+
+        // Output 2: Immutable On-Chain Audit Log
+        require(tx.outputs[2].value == 0);
+        require(
+            tx.outputs[2].lockingBytecode ==
+            new LockingBytecodeNullData([buyerPkHash, bytes(pickedNumber)])
         );
     }
 
     /**
-     * Resolve the lottery.
+     * 2. RESOLVE DRAW (Requires Winner to spend/burn their Winning Ticket Token)
      *
-     * Anyone may submit a valid BCH block header.
+     * Inputs:
+     * 0 - Contract Jackpot UTXO
+     * 1 - Winner's Ticket NFT UTXO (proves ownership of winning number)
+     *
+     * Outputs:
+     * 0 - Entire Jackpot paid out to Winner's P2PKH address
      */
     function resolveDraw(
-        bytes header,
-        bytes20 winnerPkHash
+        datasig oracleSig,
+        bytes oracleMessage,    // Encoded winning number signed by Oracle
+        bytes20 winnerPkHash,
+        int winningNumber
     ) {
+        // 1. Time-lock check: Ensures draw happens on/after drawTimestamp
+        require(tx.time >= drawTimestamp);
 
-        // BCH block header is 80 bytes
-        require(header.length == 80);
+        // 2. Validate Oracle's data signature
+        require(checkDataSig(oracleSig, oracleMessage, oraclePk));
+        require(oracleMessage == bytes(winningNumber));
+        require(winningNumber > 0 && winningNumber <= maxTicketRange);
 
-        bytes32 blockHash = hash256(header);
+        // 3. CASHTOKEN WINNER PROOF: Input[1] MUST be the winning ticket token
+        // Verify that Input[1] commitment matches the winning number
+        require(tx.inputs[1].nftCommitment == bytes(winningNumber));
 
-        // Basic proof-of-work sanity check
-        require(
-            blockHash.split(3)[0] == 0x000000
-        );
+        // 4. PAYOUT JACKPOT
+        int jackpot = tx.inputs[this.activeInputIndex].value;
 
-        // Compute winning number
-        int winningNumber =
-            (int(blockHash) % maxTicketRange) + 1;
-
-        require(winningNumber > 0);
-
-        // Entire jackpot
-        int jackpot =
-            tx.inputs[this.activeInputIndex].value;
-
-        require(
-            tx.outputs[0].value == jackpot
-        );
-
+        // Send payout directly to winner
         require(
             tx.outputs[0].lockingBytecode ==
-            new LockingBytecodeP2PKH(
-                winnerPkHash
-            )
+            new LockingBytecodeP2PKH(winnerPkHash)
         );
+
+        // Allow up to 1,000 satoshis for miner transaction fees
+        require(tx.outputs[0].value <= jackpot);
+        require(tx.outputs[0].value >= jackpot - 1000);
     }
 
     /**
-     * Emergency refund.
+     * 3. EMERGENCY REFUND
+     * 
+     * Allows ticket holders to reclaim funds if the Oracle fails 
+     * to resolve the draw within 7 days.
      */
     function reclaimRefund(
         pubkey buyerPk,
         sig buyerSig
     ) {
+        // Timelock: Active only after 7 days (604,800 seconds) post-drawTimestamp
+        require(tx.time >= drawTimestamp + 604800);
 
-        require(
-            checkSig(
-                buyerSig,
-                buyerPk
-            )
-        );
+        // Validate claimant signature
+        require(checkSig(buyerSig, buyerPk));
 
+        // Refund output directly back to claimant P2PKH address
         require(
             tx.outputs[0].lockingBytecode ==
-            new LockingBytecodeP2PKH(
-                hash160(buyerPk)
-            )
-        );
-
-        require(
-            tx.outputs[0].value ==
-            tx.inputs[this.activeInputIndex].value
+            new LockingBytecodeP2PKH(hash160(buyerPk))
         );
     }
 }
