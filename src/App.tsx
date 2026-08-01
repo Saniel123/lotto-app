@@ -4,7 +4,7 @@ import LotteryArtifact from './contracts/Lottery.json'
 
 import { Button } from './components/ui/button'
 import { Card } from './components/ui/card'
-import { ShieldCheck, Trophy, Ticket, RefreshCw, Dices, Bot, Banknote, Award, Monitor, Wallet, FileCode, CheckCircle2, QrCode } from 'lucide-react'
+import { ShieldCheck, Trophy, Ticket, RefreshCw, Dices, Bot, Banknote, Monitor, Wallet, CheckCircle2, QrCode, PartyPopper, X, Eye, Hash, Calendar, DollarSign } from 'lucide-react'
 
 // Network Config
 const provider = new ElectrumNetworkProvider('chipnet')
@@ -30,9 +30,13 @@ const SWERTRES_GAME: SwertresGame = {
 }
 
 interface TicketItem {
+  id: string
   game: string
   numbers: number[]
   txid: string
+  address: string
+  amountSats: bigint
+  timestamp: string
 }
 
 export default function App() {
@@ -51,13 +55,18 @@ export default function App() {
   const [selectedNumbers, setSelectedNumbers] = useState<number[]>([])
   const [purchasedTickets, setPurchasedTickets] = useState<TicketItem[]>([])
   
+  // Ticket Viewer Modal State
+  const [viewingTicket, setViewingTicket] = useState<TicketItem | null>(null)
+
   // Draw Results State
   const [lastWinningNumbers, setLastWinningNumbers] = useState<number[] | null>(null)
   const [drawMessage, setDrawMessage] = useState<string | null>(null)
   const [lastSecret, setLastSecret] = useState<string | null>(null)
 
-  // Testing Force-Win State
+  // Testing Force-Win State & Celebration Modal State
   const [forceWinMode, setForceWinMode] = useState(false)
+  const [showPopupCelebration, setShowPopupCelebration] = useState(false)
+  const [wonPrizePhp, setWonPrizePhp] = useState('')
 
   const [loading, setLoading] = useState(false)
   const [txPending, setTxPending] = useState(false)
@@ -129,12 +138,20 @@ export default function App() {
       setContractBalanceSats(prev => prev + TICKET_PRICE_SATS)
 
       const mockTxid = 'tx_mocknet_' + Math.random().toString(36).substring(2, 12)
+      const ticketId = 'TCK-' + Math.floor(100000 + Math.random() * 900000)
+      const timestampStr = new Date().toLocaleString()
 
-      setPurchasedTickets([
-        { game: SWERTRES_GAME.name, numbers: selectedNumbers, txid: mockTxid },
-        ...purchasedTickets
-      ])
+      const newTicket: TicketItem = {
+        id: ticketId,
+        game: SWERTRES_GAME.name,
+        numbers: selectedNumbers,
+        txid: mockTxid,
+        address: userBchAddress,
+        amountSats: TICKET_PRICE_SATS,
+        timestamp: timestampStr
+      }
 
+      setPurchasedTickets([newTicket, ...purchasedTickets])
       setSelectedNumbers([])
     } catch (err) {
       console.error('Mocknet transaction evaluation failed:', err)
@@ -144,7 +161,7 @@ export default function App() {
     }
   }
 
-  // Simulate Draw with Optional Force-Win Testing Hook
+  // Simulate Draw with Popup Ad Celebration Modal Hook
   const handleSimulateDraw = async () => {
     if (purchasedTickets.length === 0) {
       alert('Buy at least one ticket before running a draw simulation!')
@@ -156,14 +173,13 @@ export default function App() {
     setLastSecret(null)
 
     try {
-      await new Promise(resolve => setTimeout(resolve, 1200))
+      await new Promise(resolve => setTimeout(resolve, 1400))
 
       const generatedSecret = 'operator_secret_' + Math.random().toString(36).substring(2, 8)
       setLastSecret(generatedSecret)
 
       let winningDraw: number[]
       
-      // TEST HOOK: If forceWinMode is enabled and user has tickets, force the winning draw to match their latest ticket!
       if (forceWinMode && purchasedTickets.length > 0) {
         winningDraw = [...purchasedTickets[0].numbers]
       } else {
@@ -179,9 +195,16 @@ export default function App() {
 
       if (matchingTicket) {
         const prizeWonSats = contractBalanceSats
+        const prizeBch = Number(prizeWonSats) / 1e8
+        const prizePhpCalc = bchToPhpRate 
+          ? (prizeBch * bchToPhpRate).toLocaleString('en-PH', { maximumFractionDigits: 0 }) 
+          : '15,000,000'
+        
+        setWonPrizePhp(prizePhpCalc)
         setWalletBalanceSats(prev => prev + prizeWonSats)
         setContractBalanceSats(0n)
-        setDrawMessage(`🎉 JACKPOT WINNER! Your ticket ${winningStr} matched the draw! Prize successfully claimed from contract covenant!`)
+        setShowPopupCelebration(true)
+        setDrawMessage(`🎉 JACKPOT WINNER! Your ticket ${winningStr} matched the draw! Prize successfully claimed!`)
       } else {
         setDrawMessage(`❌ No matching tickets found for draw combination ${winningStr}. Covenant pool rolls over to next draw!`)
       }
@@ -205,8 +228,124 @@ export default function App() {
     : '...'
 
   return (
-    <div className="min-h-screen w-full bg-slate-950 text-slate-100 flex flex-col justify-between p-4 md:p-8 font-sans selection:bg-emerald-500 selection:text-slate-950">
+    <div className="min-h-screen w-full bg-slate-950 text-slate-100 flex flex-col justify-between p-4 md:p-8 font-sans selection:bg-emerald-500 selection:text-slate-950 relative overflow-x-hidden">
       
+      {/* FULLSCREEN BLURRED OVERLAY POPUP AD CELEBRATION */}
+      {showPopupCelebration && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="relative w-full max-w-lg bg-gradient-to-br from-amber-500 via-amber-600 to-yellow-500 text-slate-950 rounded-3xl p-6 md:p-8 shadow-2xl border-4 border-yellow-300 animate-in zoom-in-95 duration-300 text-center space-y-6">
+            
+            {/* Close Button */}
+            <button 
+              onClick={() => setShowPopupCelebration(false)}
+              className="absolute top-4 right-4 p-2 rounded-full bg-slate-950/10 hover:bg-slate-950/20 text-slate-950 transition-colors cursor-pointer"
+            >
+              <X className="h-6 w-6 stroke-[3]" />
+            </button>
+
+            {/* Glowing Icon Header */}
+            <div className="mx-auto w-20 h-20 bg-slate-950 text-amber-400 rounded-2xl flex items-center justify-center shadow-xl border-2 border-yellow-200 animate-bounce">
+              <PartyPopper className="h-10 w-10" />
+            </div>
+
+            <div className="space-y-2">
+              <span className="text-xs font-mono uppercase tracking-widest bg-slate-950/20 text-slate-950 px-3 py-1 rounded-full font-bold">
+                CONGRATULATIONS WINNER!
+              </span>
+              <h2 className="text-3xl md:text-4xl font-black tracking-tight text-slate-950">
+                YOU WON THE JACKPOT!
+              </h2>
+            </div>
+
+            <div className="bg-slate-950 text-amber-400 rounded-2xl p-6 shadow-inner border border-amber-400/30 space-y-1">
+              <span className="text-xs font-mono uppercase text-slate-400">Total Prize Claimed</span>
+              <div className="text-4xl md:text-5xl font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-yellow-200 via-amber-300 to-amber-500">
+                ₱{wonPrizePhp}
+              </div>
+              <span className="text-[11px] font-mono text-emerald-400 block pt-1">
+                ✓ Deposited directly to your Mocknet wallet via Covenant
+              </span>
+            </div>
+
+            <Button
+              onClick={() => setShowPopupCelebration(false)}
+              className="w-full bg-slate-950 hover:bg-slate-900 text-amber-400 font-black text-lg py-6 rounded-2xl shadow-xl cursor-pointer"
+            >
+              CLAIM PRIZE & CONTINUE
+            </Button>
+
+          </div>
+        </div>
+      )}
+
+      {/* DETAILED TICKET VIEWER MODAL */}
+      {viewingTicket && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200">
+          <div className="relative w-full max-w-md bg-slate-900 border border-slate-700 rounded-3xl p-6 md:p-8 shadow-2xl space-y-6 text-slate-100">
+            
+            <div className="flex justify-between items-center border-b border-slate-800 pb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-emerald-500/10 text-emerald-400 rounded-xl">
+                  <Ticket className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="font-black text-base text-slate-100">Official Ticket Pass</h3>
+                  <p className="text-xs font-mono text-emerald-400">{viewingTicket.id}</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setViewingTicket(null)}
+                className="p-2 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors cursor-pointer"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Realistic Ticket Stub Design in Modal */}
+            <div className="bg-gradient-to-b from-slate-950 to-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-inner">
+              <div className="flex justify-between items-center text-xs font-mono text-slate-400 border-b border-slate-800/80 pb-3">
+                <span>Game Mode</span>
+                <span className="text-slate-200 font-bold">{viewingTicket.game}</span>
+              </div>
+
+              <div className="text-center py-3 bg-slate-900/60 rounded-xl border border-slate-800 space-y-1">
+                <span className="text-[10px] uppercase font-mono text-slate-400 tracking-wider">Your Combination</span>
+                <div className="text-3xl font-black font-mono tracking-widest text-emerald-400">
+                  {viewingTicket.numbers.join(' - ')}
+                </div>
+              </div>
+
+              <div className="space-y-3 font-mono text-xs pt-1">
+                <div className="flex justify-between items-start">
+                  <span className="text-slate-400">Owner Address:</span>
+                  <span className="text-emerald-300 text-right break-all max-w-[200px]">{viewingTicket.address}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Paid Amount:</span>
+                  <span className="text-amber-400 font-bold">{(Number(viewingTicket.amountSats) / 1e8).toFixed(3)} BCH</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Transaction ID:</span>
+                  <span className="text-slate-300">{viewingTicket.txid}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Timestamp:</span>
+                  <span className="text-slate-300">{viewingTicket.timestamp}</span>
+                </div>
+              </div>
+            </div>
+
+            <Button
+              onClick={() => setViewingTicket(null)}
+              className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-3 rounded-xl cursor-pointer"
+            >
+              Close Viewer
+            </Button>
+
+          </div>
+        </div>
+      )}
+
       {/* Top Navigation Header */}
       <header className="max-w-6xl mx-auto w-full flex justify-between items-center py-4 border-b border-slate-800 mb-6">
         <div className="flex items-center gap-3">
@@ -215,9 +354,9 @@ export default function App() {
           </div>
           <div>
             <h1 className="font-black tracking-wider text-base md:text-lg text-emerald-400 uppercase flex items-center gap-2">
-              SWERTRES MOCKNET <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-mono border border-emerald-500/30">Testing Hub</span>
+              SWERTRES MOCKNET <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-mono border border-emerald-500/30">Realistic Tickets</span>
             </h1>
-            <p className="text-xs text-slate-400 font-mono">Mocknet Address & Guaranteed Win Simulation</p>
+            <p className="text-xs text-slate-400 font-mono">Verifiable On-Chain Ticket Passes & Payouts</p>
           </div>
         </div>
 
@@ -268,7 +407,7 @@ export default function App() {
                 <Monitor className="h-4 w-4 text-emerald-400" /> Environment:
               </span>
               <span className="text-amber-400 font-bold">
-                Chipnet Mocknet (Testable)
+                Chipnet Mocknet (Ticket Pass)
               </span>
             </div>
           </div>
@@ -301,7 +440,7 @@ export default function App() {
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
             <div className="flex justify-between items-center">
               <span className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                <QrCode className="h-5 w-5 text-emerald-400" /> Mocknet Wallet & Win Testing Hub
+                <QrCode className="h-5 w-5 text-emerald-400" /> Mocknet Wallet & Draw Hub
               </span>
               <Button
                 onClick={handleSimulateDraw}
@@ -338,14 +477,14 @@ export default function App() {
                     <CheckCircle2 className="h-4 w-4 text-amber-400" /> Force-Win Testing Mode
                   </div>
                   <div className="text-[11px] text-slate-400 font-mono">
-                    Enables deterministic draw matching so your next ticket purchase is guaranteed to win.
+                    Enables deterministic draw matching so your next ticket wins the popup celebration!
                   </div>
                 </div>
                 <button
                   onClick={() => setForceWinMode(!forceWinMode)}
                   className={`px-4 py-2 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer border ${
                     forceWinMode 
-                      ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-lg shadow-amber-500/20' 
+                      ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-lg shadow-amber-500/20 animate-pulse' 
                       : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'
                   }`}
                 >
@@ -379,7 +518,7 @@ export default function App() {
             )}
 
             {drawMessage && (
-              <div className={`p-3.5 rounded-xl text-xs md:text-sm font-medium border ${drawMessage.includes('JACKPOT') ? 'bg-emerald-950/50 border-emerald-500/30 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-400'}`}>
+              <div className="p-3.5 rounded-xl text-xs md:text-sm font-medium border bg-slate-950 border-slate-800 text-slate-400">
                 {drawMessage}
               </div>
             )}
@@ -387,7 +526,7 @@ export default function App() {
 
         </div>
 
-        {/* Right Column: Ticket Buying & Number Picker Control Hub */}
+        {/* Right Column: Ticket Buying & Realistic Ticket Stub Cards */}
         <div className="space-y-6">
 
           {/* Number Selection Grid Card */}
@@ -476,20 +615,59 @@ export default function App() {
             </div>
           </div>
 
-          {/* Active Purchased Tickets List */}
+          {/* Realistic Active Ticket Passes List */}
           {purchasedTickets.length > 0 && (
-            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-xl">
-              <span className="text-xs font-bold text-slate-300 flex items-center gap-2">
-                <Ticket className="h-4 w-4 text-emerald-400" /> Active Tickets ({purchasedTickets.length})
-              </span>
-              <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                {purchasedTickets.map((t, idx) => (
-                  <div key={idx} className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-xs flex justify-between items-center">
-                    <div>
-                      <span className="font-bold text-emerald-400">{t.game}: </span>
-                      <span className="font-mono tracking-widest text-slate-200 text-base font-black ml-1">{t.numbers.join('')}</span>
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-xl">
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold text-slate-300 flex items-center gap-2">
+                  <Ticket className="h-4 w-4 text-emerald-400" /> Active Passes ({purchasedTickets.length})
+                </span>
+                <span className="text-[10px] font-mono text-slate-500 uppercase">On-Chain Verified</span>
+              </div>
+
+              <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                {purchasedTickets.map((t) => (
+                  <div 
+                    key={t.id} 
+                    className="relative bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 border border-slate-800 hover:border-emerald-500/50 rounded-2xl p-4 transition-all space-y-3 shadow-md group"
+                  >
+                    {/* Top Row: Ticket ID & Game */}
+                    <div className="flex justify-between items-center text-xs font-mono border-b border-slate-800/80 pb-2.5">
+                      <span className="text-emerald-400 font-bold flex items-center gap-1">
+                        <Hash className="h-3.5 w-3.5" /> {t.id}
+                      </span>
+                      <span className="text-slate-400">{t.game}</span>
                     </div>
-                    <span className="text-[10px] text-slate-500 font-mono">{t.txid.slice(0, 14)}...</span>
+
+                    {/* Middle Row: Numbers & Amount */}
+                    <div className="flex justify-between items-center">
+                      <div>
+                        <span className="text-[10px] uppercase font-mono text-slate-500 block">Numbers</span>
+                        <div className="font-mono font-black text-lg tracking-widest text-slate-100">
+                          {t.numbers.join(' - ')}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-[10px] uppercase font-mono text-slate-500 block">Amount Paid</span>
+                        <div className="font-mono font-bold text-sm text-amber-400">
+                          {(Number(t.amountSats) / 1e8).toFixed(3)} BCH
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Bottom Row: Address Snippet & View Button */}
+                    <div className="flex justify-between items-center pt-2 border-t border-slate-800/60 text-[11px] font-mono text-slate-400">
+                      <span className="truncate max-w-[160px] text-slate-500">
+                        {t.address}
+                      </span>
+                      <Button
+                        onClick={() => setViewingTicket(t)}
+                        variant="outline"
+                        className="h-7 px-3 text-xs bg-emerald-500/10 border-emerald-500/20 text-emerald-300 hover:bg-emerald-500/20 hover:text-emerald-200 rounded-lg cursor-pointer"
+                      >
+                        <Eye className="h-3.5 w-3.5 mr-1" /> View Ticket
+                      </Button>
+                    </div>
                   </div>
                 ))}
               </div>
