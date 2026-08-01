@@ -4,8 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "compile:contract": "cashc src/contracts/Lottery.cash --output src/contracts/Lottery.json",
+    "predev": "npm run compile:contract",
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run compile:contract && tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
   },
@@ -13,9 +15,13 @@
     "@base-ui/react": "^1.6.0",
     "@fontsource-variable/geist": "^5.3.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@walletconnect/modal": "^2.7.0",
+    "@walletconnect/sign-client": "^2.23.10",
+    "cashscript": "^0.13.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.28.0",
+    "qrcode.react": "^4.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "shadcn": "^4.16.1",
@@ -28,8 +34,10 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",
+    "cashc": "^0.13.2",
     "oxlint": "^1.75.0",
     "typescript": "~6.0.2",
-    "vite": "^8.2.0"
+    "vite": "^8.2.0",
+    "vite-plugin-node-polyfills": "^0.28.0"
   }
 }

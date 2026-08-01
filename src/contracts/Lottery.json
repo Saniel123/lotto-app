@@ -1,0 +1,54 @@
+{
+  "contractName": "Lottery",
+  "constructorInputs": [
+    { "name": "manager", "type": "pubkey" },
+    { "name": "player1", "type": "pubkey" },
+    { "name": "player2", "type": "pubkey" },
+    { "name": "ticketPrice", "type": "int" }
+  ],
+  "abi": [
+    {
+      "name": "payout",
+      "inputs": [
+        { "name": "managerSig", "type": "sig" },
+        { "name": "winnerPk", "type": "pubkey" }
+      ]
+    },
+    {
+      "name": "refund",
+      "inputs": [
+        { "name": "playerSig", "type": "sig" },
+        { "name": "playerPk", "type": "pubkey" },
+        { "name": "expirationHeight", "type": "int" }
+      ]
+    }
+  ],
+  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_ROLL OP_SWAP OP_CHECKSIGVERIFY OP_4 OP_PICK OP_EQUAL OP_4 OP_PICK OP_ROT OP_EQUAL OP_BOOLOR OP_VERIFY OP_2 OP_MUL e803 OP_SUB OP_ROT OP_HASH160 76a914 OP_SWAP OP_CAT 88ac OP_CAT OP_0 OP_OUTPUTVALUE OP_ROT OP_GREATERTHANOREQUAL OP_VERIFY OP_0 OP_OUTPUTBYTECODE OP_EQUAL OP_NIP OP_ELSE OP_4 OP_ROLL OP_1 OP_NUMEQUALVERIFY OP_6 OP_ROLL OP_CHECKLOCKTIMEVERIFY OP_DROP OP_4 OP_ROLL OP_5 OP_PICK OP_CHECKSIGVERIFY OP_4 OP_PICK OP_ROT OP_EQUAL OP_4 OP_PICK OP_3 OP_ROLL OP_EQUAL OP_BOOLOR OP_VERIFY OP_ROT OP_HASH160 76a914 OP_SWAP OP_CAT 88ac OP_CAT OP_0 OP_OUTPUTBYTECODE OP_EQUAL OP_NIP OP_NIP OP_ENDIF",
+  "source": "pragma cashscript ~0.13.0;\r\n\r\n// Transparent 2-Player Lottery Covenant on Bitcoin Cash\r\ncontract Lottery(\r\n    pubkey manager,       // Coordinator authorized to trigger the winner payout\r\n    pubkey player1,       // Compressed Public Key of Player 1\r\n    pubkey player2,       // Compressed Public Key of Player 2\r\n    int ticketPrice       // Fixed ticket price in Satoshis (e.g., 100000 = 0.001 BCH)\r\n) {\r\n    // 1. Payout Function: Distributes total jackpot to the winner chosen by manager\r\n    function payout(sig managerSig, pubkey winnerPk) {\r\n        // Enforce that only the manager can sign to initiate the draw\r\n        require(checkSig(managerSig, manager));\r\n\r\n        // Enforce that winner MUST be either player1 or player2\r\n        require(winnerPk == player1 || winnerPk == player2);\r\n\r\n        // Calculate total jackpot (minus 1000 Satoshis for miner transaction fee)\r\n        int totalPrize = ticketPrice * 2 - 1000;\r\n\r\n        // Construct P2PKH locking script for the winner's public key\r\n        bytes20 winnerHash = hash160(winnerPk);\r\n        bytes winnerLockingBytecode = new LockingBytecodeP2PKH(winnerHash);\r\n\r\n        // Covenant Enforcement: Force output #0 to send totalPrize directly to winner\r\n        require(tx.outputs[0].value >= totalPrize);\r\n        require(tx.outputs[0].lockingBytecode == winnerLockingBytecode);\r\n    }\r\n\r\n    // 2. Refund Function: Enables players to reclaim funds if draw fails past a block target\r\n    function refund(sig playerSig, pubkey playerPk, int expirationHeight) {\r\n        // Time lock safety: Cannot refund before the expiration target block height\r\n        require(tx.time >= expirationHeight);\r\n        \r\n        // Verify signature of the claiming player\r\n        require(checkSig(playerSig, playerPk));\r\n        require(playerPk == player1 || playerPk == player2);\r\n\r\n        // Covenant Enforcement: Refund output must return to the claiming player's address\r\n        bytes20 playerHash = hash160(playerPk);\r\n        bytes playerLockingBytecode = new LockingBytecodeP2PKH(playerHash);\r\n\r\n        require(tx.outputs[0].lockingBytecode == playerLockingBytecode);\r\n    }\r\n}",
+  "fingerprint": "d70a0b5fcc5c95170756be71f7aaf3e93633464948b116294138a6f56467da6e",
+  "debug": {
+    "bytecode": "5479009c63557a7cad54798754797b879b69529502e803947ba90376a9147c7e0288ac7e00cc7ba26900cd877767547a519d567ab175547a5579ad54797b875479537a879b697ba90376a9147c7e0288ac7e00cd87777768",
+    "sourceMap": "11:4:28:5;;;;;13:25:13:35;;:37::44;:8::47:1;16:16:16:24:0;;:::35:1;:39::47:0;;:51::58;:39:::1;:16;:8::60;19:39:19:40:0;:25:::1;:43::47:0;:25:::1;22:37:22:45:0;:29::46:1;23:38:23:74:0;:63::73;:38::74:1;;;26:27:26:28:0;:16::35:1;:39::49:0;:16:::1;:8::51;27:27:27:28:0;:16::45:1;:8::72;11:53:28:5;:4;31::44::0;;;;33:27:33:43;;:8::45:1;;36:25:36:34:0;;:36::44;;:8::47:1;37:16:37:24:0;;:28::35;:16:::1;:39::47:0;;:51::58;;:39:::1;:16;:8::60;40:37:40:45:0;:29::46:1;41:38:41:74:0;:63::73;:38::74:1;;;43:27:43:28:0;:16::45:1;:8::72;31:74:44:5;;4:0:45:1",
+    "logs": [],
+    "requires": [
+      { "ip": 12, "line": 13 },
+      { "ip": 21, "line": 16 },
+      { "ip": 37, "line": 26 },
+      { "ip": 41, "line": 27 },
+      { "ip": 49, "line": 33 },
+      { "ip": 55, "line": 36 },
+      { "ip": 66, "line": 37 },
+      { "ip": 77, "line": 43 }
+    ],
+    "sourceTags": "37:37:sc;73:74:sc"
+  },
+  "compiler": {
+    "name": "cashc",
+    "version": "0.13.2",
+    "options": {
+      "enforceFunctionParameterTypes": true,
+      "enforceLocktimeGuard": true
+    }
+  },
+  "updatedAt": "2026-08-01T03:30:24.334Z"
+}
