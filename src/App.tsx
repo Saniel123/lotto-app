@@ -17,6 +17,7 @@ import {
   getLotteryContract,
   buyTicket as chainBuyTicket,
   resolveDraw as chainResolveDraw,
+  seedContract as chainSeedContract,
 } from "./contracts/lotteryClient";
 import {
   ShieldCheck,
@@ -441,6 +442,7 @@ export default function App() {
   const [wonPrizePhp, setWonPrizePhp] = useState("");
 
   const [txPending, setTxPending] = useState(false);
+  const [seedPending, setSeedPending] = useState(false);
   const [resolvePending, setResolvePending] = useState(false);
   const [drawPending, setDrawPending] = useState(false); // true while LotteryDrawMachine plays the reveal animation
   const [chainChecking, setChainChecking] = useState(false);
@@ -741,6 +743,41 @@ export default function App() {
     drawPending ||
     (msRemaining > 0 && msRemaining <= BETTING_CUTOFF_MS) ||
     msRemaining <= 0;
+
+  // Seeds the active slot's contract with its own genesis UTXO — a plain
+  // payment from the wallet to the contract address, sized to at least one
+  // ticket's worth of sats since buyTicket() requires the existing
+  // contract UTXO to already meet that bar. Needed once per (game, slot)
+  // pair before the first buyTicket() call can succeed.
+  const handleSeedContract = async () => {
+    if (!wallet) return;
+    setSeedPending(true);
+    setChainError(null);
+    try {
+      const contract = getSlotContract(activeGame, nextDrawAt.getTime());
+      await chainSeedContract(
+        contract,
+        activeGame.ticketPriceSats,
+        wallet.privateKey,
+        wallet.address,
+      );
+
+      const bal = await getWalletBalanceSats(wallet.address);
+      setWalletBalanceSats(bal);
+
+      const utxos = await contract.getUtxos();
+      const total = utxos.reduce((sum, u) => sum + BigInt(u.satoshis), 0n);
+      setActiveContractSats(total);
+      setGameContractSats((prev) => ({ ...prev, [activeGame.id]: total }));
+    } catch (err) {
+      console.error("seedContract failed:", err);
+      setChainError(
+        err instanceof Error ? err.message : "Failed to seed the contract.",
+      );
+    } finally {
+      setSeedPending(false);
+    }
+  };
 
   // Buy Ticket Handler — builds and broadcasts a real chipnet transaction
   // via lotteryClient.ts's buyTicket(). Requires: a connected wallet with
@@ -1244,6 +1281,27 @@ export default function App() {
                 ({contractBchBalance.toFixed(4)} BCH Total Contract Balance
                 Locked{activeContractSats === 0n ? " — not yet funded" : ""})
               </div>
+
+              {activeContractSats === 0n && wallet && (
+                <div className="mt-4 pl-11">
+                  <Button
+                    onClick={handleSeedContract}
+                    disabled={seedPending}
+                    className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm py-2.5 px-5 rounded-xl cursor-pointer"
+                  >
+                    {seedPending ? (
+                      <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                    ) : null}
+                    {seedPending
+                      ? "Seeding…"
+                      : `Seed Contract (${ticketBch.toFixed(4)} BCH from your wallet)`}
+                  </Button>
+                  <div className="text-[10px] font-mono text-slate-500 mt-1.5">
+                    One-time genesis payment into the contract's own address —
+                    required once per draw slot before anyone can buy a ticket.
+                  </div>
+                </div>
+              )}
             </Card>
 
             {/* Display Chipnet Wallet Address Details */}

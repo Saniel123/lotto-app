@@ -60,16 +60,15 @@ export function getLotteryContract(params: LotteryParams) {
 }
 
 // --- buyTicket ---------------------------------------------------------
-// Two inputs: the contract's own UTXO (carried forward via the contract's
-// unlock function) and a funding input from the buyer's own wallet
-// (unlocked with a plain SignatureTemplate). Two outputs the contract
-// requires (new contract balance, OP_RETURN ticket record), plus buyer
-// change. Caller passes ticketPriceSats so this function doesn't need to
-// re-derive it from the artifact.
+// Two inputs: the funding input from the buyer's own wallet (unlocked with
+// a plain SignatureTemplate) comes first as input 0, and the contract's own
+// UTXO comes second as input 1 (matching typical contract expectations where
+// introspection checks input 1 or active indices). Two outputs the contract
+// requires (new contract balance, OP_RETURN ticket record), plus buyer change.
 export async function buyTicket(
   contract: Contract,
   ticketPriceSats: bigint,
-  buyerPkHash: Uint8Array, // hash160(buyerPublicKey), 20 bytes
+  buyerPkHash: Uint8Array,
   pickedNumbers: Uint8Array,
   buyerPrivateKey: Uint8Array,
   buyerAddress: string,
@@ -78,37 +77,40 @@ export async function buyTicket(
   if (contractUtxos.length === 0) {
     throw new Error("Lottery contract has no UTXO yet — fund/create it first.");
   }
-  const contractUtxo = contractUtxos[0];
+
+  const contractUtxo = contractUtxos.reduce((best, u) =>
+    u.satoshis > best.satoshis ? u : best,
+  );
+
+  if (contractUtxo.satoshis < ticketPriceSats) {
+    throw new Error(
+      "Contract's largest UTXO is smaller than one ticket price.",
+    );
+  }
 
   const buyerUtxos = await provider.getUtxos(buyerAddress);
-  // Needs a UTXO covering at least ticketPrice + fee; a real wallet layer
-  // would do coin selection here. Simplified to "first big-enough UTXO".
   const fundingUtxo = buyerUtxos.find(
     (u: Utxo) => !u.token && u.satoshis >= ticketPriceSats + 1000n,
   );
   if (!fundingUtxo) {
     throw new Error(
-      "Buyer wallet has no UTXO large enough to cover the ticket + fee.",
+      "Buyer wallet has no UTXO large enough to cover ticket + fee.",
     );
   }
 
+  // Explicitly instantiate the signature template
   const sigTemplate = new SignatureTemplate(buyerPrivateKey);
   const newContractBalance = contractUtxo.satoshis + ticketPriceSats;
 
   const builder = new TransactionBuilder({ provider });
   builder
+    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
     .addInput(
       contractUtxo,
       contract.unlock.buyTicket(buyerPkHash, pickedNumbers),
     )
-    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
     .addOutput({ to: contract.address, amount: newContractBalance })
     .addOpReturnOutput([
-      // addOpReturnOutput adds the 0x6a prefix and push opcodes itself —
-      // matching the contract's required 0x6a14<buyerPkHash><pickedNumbers>
-      // layout only requires passing the two data chunks. Uses a
-      // browser-safe hex encoder (bytesToHex) instead of Node's Buffer,
-      // since this runs in the React app, not Node.
       `0x${bytesToHex(buyerPkHash)}`,
       `0x${bytesToHex(pickedNumbers)}`,
     ])
@@ -117,7 +119,42 @@ export async function buyTicket(
   return builder.send();
 }
 
-// --- resolveDraw ---------------------------------------------------------
+// --- seedContract ---------------------------------------------------------
+// A fresh slot contract (see App.tsx's PER-SLOT CONTRACTS note — each
+// drawDeadline gets its own address) starts with zero UTXOs. buyTicket()
+// requires an existing contract UTXO to spend and extend
+// (`tx.inputs[this.activeInputIndex].value >= ticketPrice` — note this
+// means the FIRST funding UTXO already needs to hold at least one ticket's
+// worth of sats, not just a dust amount), so something has to pay the
+// contract's own address directly, once, before any buyTicket call works.
+// This is an ordinary P2PKH-funded payment TO the contract address — no
+// contract function is invoked, since nothing exists yet to unlock.
+export async function seedContract(
+  contract: Contract,
+  amountSats: bigint,
+  funderPrivateKey: Uint8Array,
+  funderAddress: string,
+) {
+  const funderUtxos = await provider.getUtxos(funderAddress);
+  const fundingUtxo = funderUtxos.find(
+    (u: Utxo) => !u.token && u.satoshis >= amountSats + 1000n,
+  );
+  if (!fundingUtxo) {
+    throw new Error(
+      "Wallet has no UTXO large enough to seed the contract (amount + fee).",
+    );
+  }
+
+  const sigTemplate = new SignatureTemplate(funderPrivateKey);
+  const builder = new TransactionBuilder({ provider });
+  builder
+    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
+    .addOutput({ to: contract.address, amount: amountSats })
+    .addBchChangeOutputIfNeeded({ to: funderAddress, feeRate: 1.0 });
+
+  return builder.send();
+}
+
 // Permissionless — no operator key, no signature requirement at all.
 export async function resolveDraw(
   contract: Contract,

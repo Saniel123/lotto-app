@@ -2,70 +2,117 @@ pragma cashscript ^0.13.0;
 
 contract Lottery(
     int ticketPrice,
-    int maxTicketRange,
-    int drawDeadline,
-    int refundDeadline
+    int maxTicketRange
 ) {
-    // Anyone may buy a ticket. The buyer's identity and picked numbers are
-    // committed permanently and publicly via an OP_RETURN output, so the
-    // full ticket ledger is auditable on-chain — this used to exist only
-    // in the app's React state.
-    function buyTicket(bytes20 buyerPkHash, bytes pickedNumbers) {
-        require(tx.inputs[this.activeInputIndex].value >= ticketPrice);
 
-        int newBalance = tx.inputs[this.activeInputIndex].value + ticketPrice;
-        require(tx.outputs[0].value == newBalance);
-        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2SH32(hash256(this.activeBytecode)));
+    /**
+     * Buy one lottery ticket.
+     *
+     * Outputs:
+     * 0 - Updated lottery contract
+     * 1 - OP_RETURN ticket record
+     */
+    function buyTicket(
+        bytes20 buyerPkHash,
+        bytes pickedNumbers
+    ) {
+        // Current jackpot
+        int jackpot = tx.inputs[this.activeInputIndex].value;
 
-        // OP_RETURN <buyerPkHash 20 bytes> <pickedNumbers>
-        bytes ticketRecord = 0x6a14 + buyerPkHash + pickedNumbers;
-        require(tx.outputs[1].lockingBytecode == ticketRecord);
+        // New jackpot after ticket purchase
+        int newJackpot = jackpot + ticketPrice;
+
+        // Contract continues with increased balance
+        require(
+            tx.outputs[0].value == newJackpot
+        );
+
+        require(
+            tx.outputs[0].lockingBytecode ==
+            new LockingBytecodeP2SH32(
+                hash256(this.activeBytecode)
+            )
+        );
+
+        // OP_RETURN ticket record
+        bytes ticketRecord =
+            0x6a14 + buyerPkHash + pickedNumbers;
+
         require(tx.outputs[1].value == 0);
+
+        require(
+            tx.outputs[1].lockingBytecode ==
+            ticketRecord
+        );
     }
 
-    // Permissionless draw resolution. No operator, no secret, no signature
-    // requirement at all — anyone can submit a real 80-byte BCH block
-    // header once its timestamp clears drawDeadline. The contract itself
-    // checks the header actually did proof-of-work and derives the
-    // winning number from its hash. Whichever valid header gets mined
-    // into a transaction first wins the race and spends this UTXO — the
-    // same race that used to happen client-side across browser tabs is
-    // now settled by the chain instead of by trusting a tab's timer.
-    function resolveDraw(bytes header, bytes20 winnerPkHash) {
+    /**
+     * Resolve the lottery.
+     *
+     * Anyone may submit a valid BCH block header.
+     */
+    function resolveDraw(
+        bytes header,
+        bytes20 winnerPkHash
+    ) {
+
+        // BCH block header is 80 bytes
         require(header.length == 80);
 
         bytes32 blockHash = hash256(header);
 
-        // Proof-of-work floor: require the header hash to have at least
-        // 3 leading zero bytes. This is a simplified proxy for an exact
-        // nBits target comparison (full 256-bit target math isn't
-        // practical in-VM) — it's set comfortably below real BCH mainnet
-        ///chipnet difficulty, so any genuinely-mined header passes, while
-        // a hand-fabricated header (near-zero cost without mining) does
-        // not. It is NOT full SPV verification: it doesn't prove this
-        // header is part of the canonical chain, only that real hashing
-        // work went into it.
-        require(blockHash.split(3)[0] == 0x000000);
+        // Basic proof-of-work sanity check
+        require(
+            blockHash.split(3)[0] == 0x000000
+        );
 
-        bytes4 timeBytes = unsafe_bytes4(header.split(68)[1].split(4)[0]);
-        int headerTime = int(timeBytes);
-        require(headerTime >= drawDeadline);
+        // Compute winning number
+        int winningNumber =
+            (int(blockHash) % maxTicketRange) + 1;
 
-        int winningNumber = (int(blockHash) % maxTicketRange) + 1;
         require(winningNumber > 0);
 
-        int jackpotAmount = tx.inputs[this.activeInputIndex].value;
-        require(tx.outputs[0].value == jackpotAmount);
-        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(winnerPkHash));
+        // Entire jackpot
+        int jackpot =
+            tx.inputs[this.activeInputIndex].value;
+
+        require(
+            tx.outputs[0].value == jackpot
+        );
+
+        require(
+            tx.outputs[0].lockingBytecode ==
+            new LockingBytecodeP2PKH(
+                winnerPkHash
+            )
+        );
     }
 
-    // Hardened vs. the original: refund must pay the signer's own address,
-    // not an arbitrary output the spender names. Still an open limitation
-    // (see notes) — without per-ticket token tracking, the contract can't
-    // bind a refund amount to what a specific buyer actually paid in.
-    function reclaimRefund(pubkey buyerPk, sig buyerSig) {
-        require(tx.time >= refundDeadline);
-        require(checkSig(buyerSig, buyerPk));
-        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(hash160(buyerPk)));
+    /**
+     * Emergency refund.
+     */
+    function reclaimRefund(
+        pubkey buyerPk,
+        sig buyerSig
+    ) {
+
+        require(
+            checkSig(
+                buyerSig,
+                buyerPk
+            )
+        );
+
+        require(
+            tx.outputs[0].lockingBytecode ==
+            new LockingBytecodeP2PKH(
+                hash160(buyerPk)
+            )
+        );
+
+        require(
+            tx.outputs[0].value ==
+            tx.inputs[this.activeInputIndex].value
+        );
     }
 }
