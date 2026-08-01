@@ -1,45 +1,47 @@
-pragma cashscript ~0.13.0;
+pragma cashscript ^0.13.0;
 
-// Transparent 2-Player Lottery Covenant on Bitcoin Cash
 contract Lottery(
-    pubkey manager,       // Coordinator authorized to trigger the winner payout
-    pubkey player1,       // Compressed Public Key of Player 1
-    pubkey player2,       // Compressed Public Key of Player 2
-    int ticketPrice       // Fixed ticket price in Satoshis (e.g., 100000 = 0.001 BCH)
+    pubkey operatorPk,
+    bytes20 secretHash,
+    int ticketPrice,
+    int maxTicketRange,
+    int drawDeadline,
+    int refundDeadline
 ) {
-    // 1. Payout Function: Distributes total jackpot to the winner chosen by manager
-    function payout(sig managerSig, pubkey winnerPk) {
-        // Enforce that only the manager can sign to initiate the draw
-        require(checkSig(managerSig, manager));
+    function buyTicket() {
+        // Enforce exact ticket fee requirement
+        require(tx.inputs[this.activeInputIndex].value >= ticketPrice);
 
-        // Enforce that winner MUST be either player1 or player2
-        require(winnerPk == player1 || winnerPk == player2);
+        int currentBalance = tx.inputs[this.activeInputIndex].value;
+        int newBalance = currentBalance + ticketPrice;
 
-        // Calculate total jackpot (minus 1000 Satoshis for miner transaction fee)
-        int totalPrize = ticketPrice * 2 - 1000;
+        require(tx.outputs[0].value == newBalance);
+        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2SH32(hash256(this.activeBytecode)));
+    }
 
-        // Construct P2PKH locking script for the winner's public key
-        bytes20 winnerHash = hash160(winnerPk);
-        bytes winnerLockingBytecode = new LockingBytecodeP2PKH(winnerHash);
+    function resolveDraw(bytes secret, sig operatorSig, bytes20 winnerPkHash) {
+        // Enforce absolute time lock: draw can only happen at or after drawDeadline
+        require(tx.time >= drawDeadline);
+        
+        require(checkSig(operatorSig, operatorPk));
+        require(hash160(secret) == secretHash);
 
-        // Covenant Enforcement: Force output #0 to send totalPrize directly to winner
-        require(tx.outputs[0].value >= totalPrize);
+        bytes32 entropyHash = sha256(secret + tx.inputs[this.activeInputIndex].outpointTransactionHash);
+        int randomSeed = int(entropyHash);
+        int winningNumber = (randomSeed % maxTicketRange) + 1;
+
+        require(winningNumber > 0);
+
+        int jackpotAmount = tx.inputs[this.activeInputIndex].value;
+        bytes25 winnerLockingBytecode = new LockingBytecodeP2PKH(winnerPkHash);
+
+        require(tx.outputs[0].value == jackpotAmount);
         require(tx.outputs[0].lockingBytecode == winnerLockingBytecode);
     }
 
-    // 2. Refund Function: Enables players to reclaim funds if draw fails past a block target
-    function refund(sig playerSig, pubkey playerPk, int expirationHeight) {
-        // Time lock safety: Cannot refund before the expiration target block height
-        require(tx.time >= expirationHeight);
-        
-        // Verify signature of the claiming player
-        require(checkSig(playerSig, playerPk));
-        require(playerPk == player1 || playerPk == player2);
-
-        // Covenant Enforcement: Refund output must return to the claiming player's address
-        bytes20 playerHash = hash160(playerPk);
-        bytes playerLockingBytecode = new LockingBytecodeP2PKH(playerHash);
-
-        require(tx.outputs[0].lockingBytecode == playerLockingBytecode);
+    function reclaimRefund(pubkey buyerPk, sig buyerSig) {
+        // Enforce absolute time lock for emergency refunds
+        require(tx.time >= refundDeadline);
+        require(checkSig(buyerSig, buyerPk));
     }
 }
