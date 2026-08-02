@@ -1048,7 +1048,7 @@ const handleQuickPick = () => {
         );
 
         setPurchaseStatus(
-          "Review and confirm the ticket payment in Paytaca...",
+          "Check your Paytaca...",
         );
 
         const result = await buyTicketViaPaytaca(
