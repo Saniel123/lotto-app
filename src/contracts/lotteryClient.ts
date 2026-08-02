@@ -10,13 +10,72 @@ import {
 import type { Utxo } from "cashscript";
 import { secp256k1 } from "@bitauth/libauth";
 import CompleteLotteryArtifact from "./Lottery.json";
-import { signWithPaytaca, type PaytacaSignedTx } from "./paytacaconnect";
+import { signWithPaytaca, type PaytacaSignedTx } from "./paytacaConnect";
 import {
   normalizeChipnetAddress,
   toTokenAwareChipnetAddress,
 } from "./wallet";
 
 const provider = new ElectrumNetworkProvider("chipnet");
+
+const TICKET_FEE_RATE = 3.0;
+const BASE_TICKET_FEE_BUFFER = 1200n;
+const PER_INPUT_FEE_BUFFER = 900n;
+
+function selectTicketFundingUtxos(
+  utxos: Utxo[],
+  ticketPriceSats: bigint,
+): Utxo[] {
+  const spendable = utxos
+    .filter((utxo) => !utxo.token)
+    .sort(
+      (a, b) =>
+        Number(
+          BigInt(b.satoshis) -
+            BigInt(a.satoshis),
+        ),
+    );
+
+  const selected: Utxo[] = [];
+  let selectedTotal = 0n;
+
+  for (const utxo of spendable) {
+    selected.push(utxo);
+    selectedTotal += BigInt(utxo.satoshis);
+
+    const estimatedFeeBuffer =
+      BASE_TICKET_FEE_BUFFER +
+      BigInt(selected.length) *
+        PER_INPUT_FEE_BUFFER;
+
+    if (
+      selectedTotal >=
+      ticketPriceSats +
+        estimatedFeeBuffer
+    ) {
+      return selected;
+    }
+  }
+
+  const availableSats = spendable.reduce(
+    (sum, utxo) =>
+      sum + BigInt(utxo.satoshis),
+    0n,
+  );
+
+  throw new Error(
+    `Insufficient spendable BCH. Required at least ${(
+      Number(
+        ticketPriceSats +
+          BASE_TICKET_FEE_BUFFER +
+          PER_INPUT_FEE_BUFFER,
+      ) / 1e8
+    ).toFixed(8)} BCH including the estimated network fee, but only ${(
+      Number(availableSats) / 1e8
+    ).toFixed(8)} BCH is available.`,
+  );
+}
+
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -90,53 +149,57 @@ export function getLotteryContract(params: LotteryParams) {
 export async function buyTicket(
   jackpotAddress: string,
   ticketPriceSats: bigint,
-  buyerPkHash: Uint8Array,
-  pickedNumber: number | bigint,
+  _buyerPkHash: Uint8Array,
+  _pickedNumber: number | bigint,
   buyerPrivateKey: Uint8Array,
   buyerAddress: string,
 ) {
   const normalizedBuyerAddress =
-    normalizeChipnetAddress(buyerAddress);
+    normalizeChipnetAddress(
+      buyerAddress,
+    );
 
   const normalizedJackpotAddress =
-    normalizeChipnetAddress(jackpotAddress);
+    normalizeChipnetAddress(
+      jackpotAddress,
+    );
 
   const buyerUtxos =
-    await provider.getUtxos(normalizedBuyerAddress);
+    await provider.getUtxos(
+      normalizedBuyerAddress,
+    );
 
-  const fundingUtxo = buyerUtxos.find(
-    (utxo: Utxo) =>
-      !utxo.token &&
-      BigInt(utxo.satoshis) >= ticketPriceSats + 1500n,
-  );
+  const fundingUtxos =
+    selectTicketFundingUtxos(
+      buyerUtxos,
+      ticketPriceSats,
+    );
 
-  if (!fundingUtxo) {
-    throw new Error(
-      "Buyer wallet has no UTXO large enough to cover the ticket price and network fee.",
+  const sigTemplate =
+    new SignatureTemplate(
+      buyerPrivateKey,
+    );
+
+  const builder =
+    new TransactionBuilder({
+      provider,
+    });
+
+  for (const utxo of fundingUtxos) {
+    builder.addInput(
+      utxo,
+      sigTemplate.unlockP2PKH(),
     );
   }
 
-  const sigTemplate =
-    new SignatureTemplate(buyerPrivateKey);
-
-  const numberHex =
-    numberToScriptNumHex(pickedNumber);
-
-  const builder =
-    new TransactionBuilder({ provider });
-
   builder
-    .addInput(
-      fundingUtxo,
-      sigTemplate.unlockP2PKH(),
-    )
     .addOutput({
       to: normalizedJackpotAddress,
       amount: ticketPriceSats,
     })
     .addBchChangeOutputIfNeeded({
       to: normalizedBuyerAddress,
-      feeRate: 3.0,
+      feeRate: TICKET_FEE_RATE,
     });
 
   return builder.send();
@@ -150,81 +213,84 @@ export async function buyTicketViaPaytaca(
   jackpotAddress: string,
   ticketPriceSats: bigint,
   buyerAddress: string,
-  buyerPkHash: Uint8Array,
+  _buyerPkHash: Uint8Array,
   pickedNumber: number | bigint,
 ): Promise<PaytacaSignedTx> {
   const normalizedBuyerAddress =
-    normalizeChipnetAddress(buyerAddress);
+    normalizeChipnetAddress(
+      buyerAddress,
+    );
 
   const normalizedJackpotAddress =
-    normalizeChipnetAddress(jackpotAddress);
+    normalizeChipnetAddress(
+      jackpotAddress,
+    );
 
   const buyerUtxos =
-    await provider.getUtxos(normalizedBuyerAddress);
-
-  const fundingUtxo = buyerUtxos.find(
-    (utxo: Utxo) =>
-      !utxo.token &&
-      BigInt(utxo.satoshis) >= ticketPriceSats + 1500n,
-  );
-
-  if (!fundingUtxo) {
-    throw new Error(
-      "Paytaca wallet has no UTXO large enough to cover the ticket price and network fee. Use the faucet first.",
+    await provider.getUtxos(
+      normalizedBuyerAddress,
     );
-  }
 
-  const numberHex =
-    numberToScriptNumHex(pickedNumber);
+  const fundingUtxos =
+    selectTicketFundingUtxos(
+      buyerUtxos,
+      ticketPriceSats,
+    );
 
   const builder =
-    new TransactionBuilder({ provider });
+    new TransactionBuilder({
+      provider,
+    });
 
-  builder
-    .addInput(
-      fundingUtxo,
+  for (const utxo of fundingUtxos) {
+    builder.addInput(
+      utxo,
       placeholderP2PKHUnlocker(
         normalizedBuyerAddress,
       ),
-    )
+    );
+  }
+
+  builder
     .addOutput({
       to: normalizedJackpotAddress,
       amount: ticketPriceSats,
     })
     .addBchChangeOutputIfNeeded({
       to: normalizedBuyerAddress,
-      feeRate: 3.0,
+      feeRate: TICKET_FEE_RATE,
     });
 
   const wcTransactionObj =
     builder.generateWcTransactionObject({
-      // Paytaca only signs. The dapp broadcasts through Electrum below.
-      // A 3 sat/byte fee rate is used above because the final DER signature
-      // can be larger than the WalletConnect placeholder used for estimation.
       broadcast: false,
       userPrompt:
         `Buy 3D Lotto ticket #${pickedNumber.toString()} for ${Number(ticketPriceSats) / 1e8} BCH`,
     });
 
   const result =
-    await signWithPaytaca(wcTransactionObj);
+    await signWithPaytaca(
+      wcTransactionObj,
+    );
 
   if (
     !result ||
-    typeof result.signedTransaction !== "string" ||
+    typeof result.signedTransaction !==
+      "string" ||
     !result.signedTransaction
   ) {
     throw new Error(
-      "Paytaca did not return a signed transaction.",
+      "Paytaca did not return a signed ticket transaction.",
     );
   }
 
   let broadcastTxid: string;
 
   try {
-    broadcastTxid = await provider.sendRawTransaction(
-      result.signedTransaction,
-    );
+    broadcastTxid =
+      await provider.sendRawTransaction(
+        result.signedTransaction,
+      );
   } catch (error) {
     const message =
       error instanceof Error
@@ -240,7 +306,8 @@ export async function buyTicketViaPaytaca(
 
   return {
     ...result,
-    signedTransactionHash: broadcastTxid,
+    signedTransactionHash:
+      broadcastTxid,
   };
 }
 

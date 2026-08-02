@@ -55,8 +55,6 @@ import {
   Zap,
   Copy,
   Check,
-  ExternalLink,
-  Droplets,
   FlaskConical,
   RotateCcw,
 } from "lucide-react";
@@ -147,7 +145,7 @@ interface TicketItem {
 
 const WALLET_STORAGE_KEY = "pcso-mocknet-lotto:chipnet-privkey-hex";
 const SIMULATION_MODE_STORAGE_KEY = "pcso-mocknet-lotto:simulation-mode";
-const PAYTACA_FAUCET_URL = "https://faucet.paytaca.com";
+const ESTIMATED_TICKET_NETWORK_FEE_SATS = 5000n;
 
 // Permanent Chipnet jackpot wallet. This is independent of the bettor wallet.
 const JACKPOT_WALLET_ADDRESS =
@@ -276,6 +274,46 @@ function getReadableError(error: unknown): string {
 // Simulation mode ships ON by default: no chipnet faucet, Electrum uptime,
 // or Paytaca install required to demo the buy -> draw flow.
 // flow. Flip it off to run the real thing against live chipnet.
+function addressesAreEqual(
+  firstAddress: string,
+  secondAddress: string,
+): boolean {
+  try {
+    const firstPkHash =
+      pkHashFromAddress(
+        normalizeChipnetAddress(
+          firstAddress,
+        ),
+      );
+
+    const secondPkHash =
+      pkHashFromAddress(
+        normalizeChipnetAddress(
+          secondAddress,
+        ),
+      );
+
+    if (
+      firstPkHash.length !==
+      secondPkHash.length
+    ) {
+      return false;
+    }
+
+    return firstPkHash.every(
+      (byte, index) =>
+        byte === secondPkHash[index],
+    );
+  } catch (error) {
+    console.warn(
+      "Could not compare BCH addresses:",
+      error,
+    );
+
+    return false;
+  }
+}
+
 function loadInitialSimulationMode(): boolean {
   if (typeof window === "undefined") return true;
   const saved = localStorage.getItem(SIMULATION_MODE_STORAGE_KEY);
@@ -373,6 +411,14 @@ export default function App() {
   const [selectedGameId, setSelectedGameId] = useState<string>("3d_lotto");
   const activeGame = LOTTO_GAMES[0];
 
+  const estimatedTicketTotalSats =
+    activeGame.ticketPriceSats +
+    ESTIMATED_TICKET_NETWORK_FEE_SATS;
+
+  const hasEstimatedTicketBalance =
+    simulationMode ||
+    bettorBalanceSats >= estimatedTicketTotalSats;
+
   const [oracleKeypair] = useState<WalletKeypair>(() => generateWallet());
 
   // One persistent CashScript address acts as the jackpot wallet.
@@ -421,6 +467,7 @@ export default function App() {
   const [drawPending, setDrawPending] = useState(false);
   const [chainError, setChainError] = useState<string | null>(null);
   const [purchaseMessage, setPurchaseMessage] = useState<string | null>(null);
+  const [purchaseStatus, setPurchaseStatus] = useState<string | null>(null);
   const [payoutPending, setPayoutPending] = useState(false);
   const [payoutTxid, setPayoutTxid] = useState<string | null>(null);
   const [pendingWinnerAddress, setPendingWinnerAddress] =
@@ -935,6 +982,15 @@ const handleQuickPick = () => {
       return;
     }
 
+    if (!hasEstimatedTicketBalance) {
+      setChainError(
+        `Your wallet needs approximately ${bchPriceFormatted(
+          estimatedTicketTotalSats,
+        )} to cover the ticket and network fee.`,
+      );
+      return;
+    }
+
     const purchasedNumbers = [...selectedNumbers];
     const pickedNumber = digitsToPickedNumber(
       purchasedNumbers,
@@ -944,6 +1000,13 @@ const handleQuickPick = () => {
     setTxPending(true);
     setChainError(null);
     setPurchaseMessage(null);
+    setPurchaseStatus(
+      simulationMode
+        ? "Creating simulated ticket..."
+        : usingPaytaca
+          ? "Preparing Paytaca transaction..."
+          : "Preparing ticket transaction...",
+    );
 
     try {
       let txid: string;
@@ -984,6 +1047,10 @@ const handleQuickPick = () => {
           normalizedBuyerAddress,
         );
 
+        setPurchaseStatus(
+          "Review and confirm the ticket payment in Paytaca...",
+        );
+
         const result = await buyTicketViaPaytaca(
           JACKPOT_WALLET_ADDRESS,
           activeGame.ticketPriceSats,
@@ -1003,6 +1070,10 @@ const handleQuickPick = () => {
         );
       } else if (wallet) {
         normalizedBuyerAddress = wallet.address;
+
+        setPurchaseStatus(
+          "Signing and broadcasting ticket transaction...",
+        );
 
         const result = await chainBuyTicket(
           JACKPOT_WALLET_ADDRESS,
@@ -1047,8 +1118,9 @@ const handleQuickPick = () => {
         ...previousTickets,
       ]);
       setSelectedNumbers([]);
+      setPurchaseStatus(null);
       setPurchaseMessage(
-        `Ticket ${purchasedNumbers.join("-")} purchased successfully.`,
+        `Ticket ${purchasedNumbers.join("-")} purchased successfully. Txid: ${txid}`,
       );
 
       // Balance reads are slower and may briefly return the pre-transaction
@@ -1064,6 +1136,7 @@ const handleQuickPick = () => {
       console.error("Buy ticket failed:", message, err);
       setChainError(message);
       setPurchaseMessage(null);
+      setPurchaseStatus(null);
     } finally {
       setTxPending(false);
     }
@@ -1180,12 +1253,25 @@ const handleQuickPick = () => {
         JACKPOT_WALLET_ADDRESS,
       );
 
+    console.log(
+      "Jackpot signer verification:",
+      {
+        rawPaytacaAddress:
+          paytaca.address,
+        normalizedPaytacaAddress:
+          connectedSignerAddress,
+        normalizedJackpotAddress,
+      },
+    );
+
     if (
-      connectedSignerAddress !==
-      normalizedJackpotAddress
+      !addressesAreEqual(
+        connectedSignerAddress,
+        normalizedJackpotAddress,
+      )
     ) {
       setChainError(
-        `Winner detected, but the connected Paytaca wallet cannot spend the jackpot. Connect ${normalizedJackpotAddress} to send the prize.`,
+        `The connected Paytaca wallet is not the jackpot wallet. Connected: ${connectedSignerAddress}. Expected: ${normalizedJackpotAddress}.`,
       );
       return;
     }
@@ -1848,89 +1934,75 @@ const handleQuickPick = () => {
   </div>
 
   {/* Available digits */}
-  <div>
-    <div className="mb-2 flex items-center justify-between">
-      <span className="text-[5px] font-bold uppercase tracking-wider text-slate-500">
-        Available Digits
-      </span>
+  <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+      <div>
+        <div className="text-xs font-bold uppercase tracking-wider text-slate-300">
+          Available Digits
+        </div>
+        <p className="mt-1 text-[11px] text-slate-500">
+          Tap a digit to add it to the next available position. Duplicate digits are allowed.
+        </p>
+      </div>
 
-      {selectedNumbers.length >=
-        activeGame.pickCount && (
-        <span className="text-[10px] font-semibold text-emerald-400">
-          Combination complete
-        </span>
-      )}
+      <div
+        className={`rounded-full border px-3 py-1 text-[10px] font-bold uppercase tracking-wide ${
+          selectedNumbers.length >= activeGame.pickCount
+            ? "border-emerald-800/60 bg-emerald-950/50 text-emerald-300"
+            : "border-slate-700 bg-slate-900 text-slate-400"
+        }`}
+      >
+        {selectedNumbers.length >= activeGame.pickCount
+          ? "Combination complete"
+          : `${activeGame.pickCount - selectedNumbers.length} remaining`}
+      </div>
     </div>
 
     <div className="grid grid-cols-5 gap-2 sm:grid-cols-10">
       {Array.from(
-        {
-          length:
-            activeGame.maxNumber + 1,
-        },
+        { length: activeGame.maxNumber + 1 },
         (_, number) => {
-          const selectionPositions =
-            selectedNumbers
-              .map(
-                (
-                  selectedNumber,
-                  position,
-                ) =>
-                  selectedNumber ===
-                  number
-                    ? position
-                    : -1,
-              )
-              .filter(
-                (position) =>
-                  position !== -1,
-              );
+          const selectionPositions = selectedNumbers
+            .map((selectedNumber, position) =>
+              selectedNumber === number ? position : -1,
+            )
+            .filter((position) => position !== -1);
 
-          const isSelected =
-            selectionPositions.length > 0;
-
+          const isSelected = selectionPositions.length > 0;
           const selectionLimitReached =
-            selectedNumbers.length >=
-            activeGame.pickCount;
+            selectedNumbers.length >= activeGame.pickCount;
+          const isDisabled = bettingClosed || selectionLimitReached;
 
           return (
             <button
               key={number}
               type="button"
-              onClick={() =>
-                toggleNumber(number)
-              }
-              disabled={
-                bettingClosed ||
-                selectionLimitReached
-              }
-              className={`relative flex h-14 items-center justify-center rounded-xl border font-mono text-lg font-black transition-all ${
+              onClick={() => toggleNumber(number)}
+              disabled={isDisabled}
+              aria-label={`Select digit ${number}`}
+              className={`relative flex aspect-square min-h-12 w-full items-center justify-center rounded-xl border font-mono text-xl font-black transition-all duration-150 ${
                 isSelected
-                  ? "border-emerald-600 bg-emerald-950/60 text-emerald-300 shadow-lg shadow-emerald-950/30"
-                  : "border-slate-800 bg-slate-950/60 text-slate-300 hover:-translate-y-0.5 hover:border-emerald-700 hover:bg-slate-800/60 hover:text-white"
+                  ? "border-emerald-500 bg-emerald-950/70 text-emerald-200 shadow-md shadow-emerald-950/40"
+                  : "border-slate-700 bg-slate-900/80 text-slate-200 hover:-translate-y-0.5 hover:border-emerald-600 hover:bg-slate-800 hover:text-white"
               } ${
-                bettingClosed ||
-                selectionLimitReached
-                  ? "cursor-not-allowed opacity-50"
-                  : "cursor-pointer"
+                isDisabled
+                  ? "cursor-not-allowed opacity-45"
+                  : "cursor-pointer active:translate-y-0 active:scale-95"
               }`}
             >
-              {number}
+              <span>{number}</span>
 
-              {selectionPositions.length >
-                0 && (
-                <div className="absolute -right-1.5 -top-1.5 flex flex-wrap justify-end gap-0.5">
-                  {selectionPositions.map(
-                    (position) => (
-                      <span
-                        key={position}
-                        className="flex h-5 min-w-5 items-center justify-center rounded-full border border-emerald-300 bg-emerald-600 px-1 text-[8px] font-black text-white shadow-md"
-                        title={`${getOrdinalLabel(position)} selected number`}
-                      >
-                        {position + 1}
-                      </span>
-                    ),
-                  )}
+              {selectionPositions.length > 0 && (
+                <div className="absolute -right-1.5 -top-1.5 flex max-w-[48px] flex-wrap justify-end gap-0.5">
+                  {selectionPositions.map((position) => (
+                    <span
+                      key={position}
+                      className="flex h-5 min-w-5 items-center justify-center rounded-full border border-emerald-200 bg-emerald-600 px-1 text-[9px] font-black leading-none text-white shadow-md"
+                      title={`${getOrdinalLabel(position)} selected digit`}
+                    >
+                      {position + 1}
+                    </span>
+                  ))}
                 </div>
               )}
             </button>
@@ -1938,57 +2010,126 @@ const handleQuickPick = () => {
         },
       )}
     </div>
+
+    {selectedNumbers.length >= activeGame.pickCount && (
+      <p className="mt-3 text-center text-[11px] text-slate-500">
+        Remove a digit from the ordered combination above to choose another one.
+      </p>
+    )}
   </div>
 
 
-
-  <div className="flex flex-col items-center justify-between gap-4 border-t border-slate-800 pt-4 sm:flex-row">
-    <div>
-      <div className="text-xs text-slate-400">
-        Ticket Price
+  <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+    <div className="grid gap-3 sm:grid-cols-3">
+      <div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+          Ticket
+        </div>
+        <div className="mt-1 font-mono text-lg font-black text-white">
+          {selectedNumbers.length === activeGame.pickCount
+            ? selectedNumbers.join("-")
+            : "—"}
+        </div>
       </div>
 
-      <div className="text-base font-bold text-white">
-        {bchPriceFormatted(
-          activeGame.ticketPriceSats,
-        )}{" "}
-        <span className="text-xs font-normal text-slate-400">
-          (
-          {phpPriceFormatted(
-            activeGame.ticketPriceSats,
-          )}
-          )
+      <div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+          Ticket Price
+        </div>
+        <div className="mt-1 font-bold text-white">
+          {bchPriceFormatted(activeGame.ticketPriceSats)}
+        </div>
+        <div className="text-[10px] text-slate-500">
+          {phpPriceFormatted(activeGame.ticketPriceSats)}
+        </div>
+      </div>
+
+      <div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+          Estimated Total
+        </div>
+        <div
+          className={`mt-1 font-bold ${
+            hasEstimatedTicketBalance
+              ? "text-emerald-300"
+              : "text-red-400"
+          }`}
+        >
+          {bchPriceFormatted(estimatedTicketTotalSats)}
+        </div>
+        <div className="text-[10px] text-slate-500">
+          Includes an estimated network-fee allowance
+        </div>
+      </div>
+    </div>
+
+    {!simulationMode && bettorAddress && (
+      <div className="mt-3 flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-xs">
+        <span className="text-slate-400">
+          Available wallet balance
+        </span>
+        <span
+          className={`font-mono font-bold ${
+            hasEstimatedTicketBalance
+              ? "text-emerald-300"
+              : "text-red-400"
+          }`}
+        >
+          {bchPriceFormatted(bettorBalanceSats)}
         </span>
       </div>
-    </div>
+    )}
 
-    <div className="flex w-full items-center space-x-3 sm:w-auto">
-      <Button
-        onClick={handleBuyTicket}
-        disabled={
-          txPending ||
-          bettingClosed ||
-          !bettorAddress ||
-          selectedNumbers.length !==
-            activeGame.pickCount
-        }
-        className="h-11 flex-1 rounded-xl bg-emerald-600 px-8 text-sm font-bold text-white shadow-lg shadow-emerald-900/40 hover:bg-emerald-500 disabled:opacity-50 sm:flex-none"
-      >
-        {txPending
-          ? usingPaytaca
+    <Button
+      onClick={handleBuyTicket}
+      disabled={
+        txPending ||
+        bettingClosed ||
+        !bettorAddress ||
+        !hasEstimatedTicketBalance ||
+        selectedNumbers.length !== activeGame.pickCount
+      }
+      className="mt-4 h-12 w-full rounded-xl bg-emerald-600 text-sm font-black text-white shadow-lg shadow-emerald-900/40 hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {txPending
+        ? purchaseStatus ??
+          (usingPaytaca
             ? "Confirm in Paytaca..."
-            : "Purchasing..."
-          : bettingClosed
-            ? "Betting Closed"
-            : !bettorAddress
-              ? "Connect a Wallet First"
-              : selectedNumbers.length !==
-                    activeGame.pickCount
-                  ? `Select ${activeGame.pickCount} Numbers`
-                  : `Buy ${selectedNumbers.join("-")} On-Chain`}
-      </Button>
-    </div>
+            : "Purchasing ticket...")
+        : bettingClosed
+          ? "Betting Closed"
+          : !bettorAddress
+            ? "Connect a Wallet First"
+            : selectedNumbers.length !== activeGame.pickCount
+              ? `Select ${activeGame.pickCount} Digits`
+              : !hasEstimatedTicketBalance
+                ? "Insufficient Wallet Balance"
+                : `Buy Ticket ${selectedNumbers.join("-")}`}
+    </Button>
+
+    {purchaseStatus && txPending && (
+      <div className="mt-3 flex items-center justify-center gap-2 text-xs text-amber-300">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400" />
+        {purchaseStatus}
+      </div>
+    )}
   </div>
+
+  {purchaseMessage && (
+    <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/40 p-3 text-xs text-emerald-300">
+      <div className="flex items-start gap-2">
+        <Check className="mt-0.5 h-4 w-4 shrink-0" />
+        <div className="min-w-0">
+          <div className="font-bold">
+            Ticket purchase completed
+          </div>
+          <div className="mt-1 break-all font-mono text-[10px] text-emerald-200/80">
+            {purchaseMessage}
+          </div>
+        </div>
+      </div>
+    </div>
+  )}
 
   {chainError && (
     <div className="flex items-center space-x-2 rounded-xl border border-red-900/60 bg-red-950/40 p-3 text-xs text-red-400">
@@ -2006,7 +2147,7 @@ const handleQuickPick = () => {
 </div>
           </Card>
 
-          {simulationMode ? (
+          {simulationMode && (
             <Card className="bg-amber-950/20 border-amber-800/50 p-6 rounded-2xl shadow-xl space-y-3">
               <h3 className="text-sm font-bold uppercase tracking-wider text-amber-300 flex items-center">
                 <FlaskConical className="w-4 h-4 mr-2" />
@@ -2027,74 +2168,6 @@ const handleQuickPick = () => {
                 Reset Simulation
               </Button>
             </Card>
-          ) : (
-            bettorAddress && (
-              <Card className="bg-slate-900/40 border-slate-800 p-6 rounded-2xl shadow-xl space-y-4">
-                <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center">
-                  <Droplets className="w-4 h-4 mr-2 text-emerald-400" />
-                  Fund Your Chipnet Wallet
-                </h3>
-
-                <div>
-                  <div className="text-[10px] uppercase font-bold text-slate-400 mb-1.5">
-                    Your Address {usingPaytaca ? "(Paytaca)" : "(Demo)"}
-                  </div>
-                  <div className="flex items-stretch bg-slate-950/70 border border-slate-800 rounded-xl overflow-hidden">
-                    <div className="flex-1 px-3 py-2.5 text-[11px] font-mono text-slate-300 break-all select-all">
-                      {bettorAddress}
-                    </div>
-                    <button
-                      onClick={() => copyAddress(bettorAddress)}
-                      className={`shrink-0 flex items-center justify-center px-3 border-l transition-colors ${
-                        addressCopied
-                          ? "border-emerald-800/60 bg-emerald-950/40 text-emerald-400"
-                          : "border-slate-800 bg-slate-900/60 text-slate-400 hover:text-emerald-400 hover:bg-slate-800/60"
-                      }`}
-                      title="Copy address"
-                    >
-                      {addressCopied ? (
-                        <Check className="w-4 h-4" />
-                      ) : (
-                        <Copy className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  {addressCopied && (
-                    <div className="text-[10px] text-emerald-400 mt-1">
-                      Copied to clipboard!
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex items-center justify-between bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
-                  <div>
-                    <div className="text-xs font-bold text-white">
-                      Need test coins?
-                    </div>
-                    <div className="text-[10px] text-slate-400">
-                      Get free tBCH from the Paytaca chipnet faucet
-                    </div>
-                  </div>
-                  <a
-                    href={PAYTACA_FAUCET_URL}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="shrink-0 inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold h-8 px-3 rounded-lg transition-colors"
-                  >
-                    Faucet
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-
-                <p className="text-[10px] text-slate-500">
-                  A single ticket purchase needs one UTXO of at least{" "}
-                  {bchPriceFormatted(activeGame.ticketPriceSats + 1500n)} in
-                  your wallet. Fund with a bit extra to cover several purchases.
-                  If the faucet is unreliable, flip on Simulation Mode above
-                  instead.
-                </p>
-              </Card>
-            )
           )}
 
           {!simulationMode && !paytaca && (
