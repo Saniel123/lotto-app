@@ -3,6 +3,7 @@ import {
   secp256k1,
   hash160,
   encodeCashAddress,
+  decodeCashAddress,
   CashAddressType,
 } from "@bitauth/libauth";
 import { ElectrumNetworkProvider } from "cashscript";
@@ -46,6 +47,19 @@ export function generateWallet(): WalletKeypair {
   return walletFromPrivateKey(generatePrivateKey());
 }
 
+/**
+ * Extracts the 20-byte pubkey hash (hash160) from any chipnet cashaddr —
+ * including addresses supplied by an externally-connected wallet like
+ * Paytaca, where we never see the private key or public key directly.
+ */
+export function pkHashFromAddress(address: string): Uint8Array {
+  const decoded = decodeCashAddress(address);
+  if (typeof decoded === "string") {
+    throw new Error(`Failed to decode address "${address}": ${decoded}`);
+  }
+  return decoded.payload;
+}
+
 // --- Private Key Hex Serialization -------------------------------------
 
 export function privateKeyToHex(privateKey: Uint8Array): string {
@@ -69,6 +83,8 @@ const provider = new ElectrumNetworkProvider("chipnet");
 
 /**
  * Retrieves all UTXOs belonging to the specified address.
+ * Works for any chipnet address — a locally generated demo wallet or a
+ * connected Paytaca address — since it's just an Electrum lookup.
  */
 export async function getWalletUtxos(address: string): Promise<Utxo[]> {
   return provider.getUtxos(address);
@@ -102,11 +118,13 @@ function scriptNumHexToNumber(hex: string): number {
 /**
  * Retrieves all CashToken NFT tickets owned by the wallet address.
  */
-export async function getWalletTickets(address: string): Promise<{
-  utxo: Utxo;
-  pickedNumber: number;
-  commitmentHex: string;
-}[]> {
+export async function getWalletTickets(address: string): Promise<
+  {
+    utxo: Utxo;
+    pickedNumber: number;
+    commitmentHex: string;
+  }[]
+> {
   const utxos = await getWalletUtxos(address);
 
   return utxos
@@ -122,6 +140,9 @@ export async function getWalletTickets(address: string): Promise<{
 }
 
 // --- Demo Key Persistence & Hardcode Fallback ----------------------------------
+// This local-key wallet is kept only as a fallback demo mode for testing
+// without a real Paytaca wallet installed. Prefer the Paytaca WalletConnect
+// flow (see paytacaConnect.ts) for real usage.
 
 const LOCAL_STORAGE_KEY = "lottery_demo_wallet_privkey";
 
@@ -135,7 +156,10 @@ export function getDemoWallet(): WalletKeypair {
   let keyHex = localStorage.getItem(LOCAL_STORAGE_KEY);
 
   if (!keyHex || keyHex.length !== 64) {
-    if (HARDCODED_DEMO_PRIVKEY_HEX && HARDCODED_DEMO_PRIVKEY_HEX.length === 64) {
+    if (
+      HARDCODED_DEMO_PRIVKEY_HEX &&
+      HARDCODED_DEMO_PRIVKEY_HEX.length === 64
+    ) {
       keyHex = HARDCODED_DEMO_PRIVKEY_HEX;
     } else {
       const newKeyPair = generateWallet();
