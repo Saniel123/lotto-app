@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from "react";
-import { ElectrumNetworkProvider } from "cashscript";
 import type { Contract } from "cashscript";
 
 import { Button } from "./components/ui/button";
@@ -12,16 +11,16 @@ import {
   privateKeyToHex,
   privateKeyFromHex,
   pkHashFromAddress,
+  normalizeChipnetAddress,
 } from "./contracts/wallet";
 import type { WalletKeypair } from "./contracts/wallet";
 import {
   getLotteryContract,
   buyTicket as chainBuyTicket,
   buyTicketViaPaytaca,
+  payWinnerViaPaytaca,
   resolveDraw as chainResolveDraw,
   resolveDrawViaPaytaca,
-  seedContract as chainSeedContract,
-  seedContractViaPaytaca,
   signOracleWinningNumber,
 } from "./contracts/lotteryClient";
 import {
@@ -35,7 +34,6 @@ import {
   fakeTxid,
   simBuyTicket,
   simResolve,
-  simSeed,
   simulateDraw,
   SIMULATED_ADDRESS,
   SIMULATED_BALANCE_SATS,
@@ -63,8 +61,6 @@ import {
   RotateCcw,
 } from "lucide-react";
 
-const provider = new ElectrumNetworkProvider("chipnet");
-
 interface LottoGame {
   id: string;
   name: string;
@@ -75,40 +71,64 @@ interface LottoGame {
   ticketPriceSats: bigint;
 }
 
+
 const LOTTO_GAMES: LottoGame[] = [
   {
-    id: "swertres",
-    name: "Swertres Lotto",
+    id: "3d_lotto",
+    name: "3D Lotto",
     shortLabel: "3D",
     maxNumber: 9,
     pickCount: 3,
-    drawDays: "Play & draw anytime",
+    drawDays: "Winning digits generated securely in the frontend",
     ticketPriceSats: 100000n, // 0.001 BCH
   },
 ];
 
+function generateFrontendDraw(
+  count: number,
+  maxNumber: number,
+): number[] {
+  if (!Number.isInteger(count) || count <= 0) {
+    throw new Error("Draw count must be a positive integer.");
+  }
+
+  if (!Number.isInteger(maxNumber) || maxNumber < 0) {
+    throw new Error("Maximum draw number must be zero or greater.");
+  }
+
+  const range = maxNumber + 1;
+  const rejectionLimit =
+    Math.floor(0x1_0000_0000 / range) * range;
+
+  const numbers: number[] = [];
+
+  while (numbers.length < count) {
+    const randomValue = new Uint32Array(1);
+    crypto.getRandomValues(randomValue);
+
+    if (randomValue[0] >= rejectionLimit) {
+      continue;
+    }
+
+    numbers.push(randomValue[0] % range);
+  }
+
+  return numbers;
+}
+
 function maxTicketRangeFor(game: LottoGame): number {
-  return 10 ** game.pickCount;
+  return (game.maxNumber + 1) ** game.pickCount;
 }
 
-// Combine individual displayed digits (e.g. [3, 3, 4]) into the single
-// on-chain `pickedNumber` in [1, maxTicketRange] that the contract expects.
-// This is the exact inverse of winningNumberToDigits() below, so a ticket's
-// pickedNumber and a draw's winningNumber use the same representation and
-// can be compared directly by resolveDraw()'s nftCommitment check.
-function digitsToPickedNumber(digits: number[]): bigint {
-  // Turn [6, 0, 2] -> 602 + 1 = 603n
-  const rawDecimal = digits.reduce((acc, digit) => acc * 10 + digit, 0);
-  return BigInt(rawDecimal + 1);
-}
-
-/** Parses a user-entered BCH amount (e.g. "1.0", "0.05") into satoshis. Returns null if invalid. */
-function bchStringToSats(bchAmount: string): bigint | null {
-  const trimmed = bchAmount.trim();
-  if (!trimmed) return null;
-  const value = Number(trimmed);
-  if (!Number.isFinite(value) || value <= 0) return null;
-  return BigInt(Math.round(value * 1e8));
+// Encodes an ordered combination into a unique 1-based contract number.
+// With maxNumber 20, [3, 11, 14] is encoded in base 21.
+function digitsToPickedNumber(numbers: number[], maxNumber: number): bigint {
+  const base = BigInt(maxNumber + 1);
+  const encoded = numbers.reduce(
+    (result, number) => result * base + BigInt(number),
+    0n,
+  );
+  return encoded + 1n;
 }
 
 interface TicketItem {
@@ -118,7 +138,8 @@ interface TicketItem {
   slotEpochMs: number;
   numbers: number[];
   txid: string;
-  address: string;
+  buyerAddress: string;
+  paymentAddress: string;
   amountSats: bigint;
   timestamp: string;
   simulated: boolean;
@@ -128,8 +149,132 @@ const WALLET_STORAGE_KEY = "pcso-mocknet-lotto:chipnet-privkey-hex";
 const SIMULATION_MODE_STORAGE_KEY = "pcso-mocknet-lotto:simulation-mode";
 const PAYTACA_FAUCET_URL = "https://faucet.paytaca.com";
 
+// Permanent Chipnet jackpot wallet. This is independent of the bettor wallet.
+const JACKPOT_WALLET_ADDRESS =
+  "bchtest:qqxsrhnzq8hlhnqq5jppgqnv4avpfzw0wqlkxw03rm";
+
+
+function getPaytacaTransactionHash(result: unknown): string {
+  if (!result || typeof result !== "object") {
+    throw new Error(
+      "Paytaca approved the request but returned no transaction result.",
+    );
+  }
+
+  const value = result as Record<string, unknown>;
+
+  const candidates = [
+    value.signedTransactionHash,
+    value.transactionHash,
+    value.txid,
+    value.hash,
+  ];
+
+  const transactionHash = candidates.find(
+    (candidate): candidate is string =>
+      typeof candidate === "string" &&
+      candidate.trim().length > 0,
+  );
+
+  if (!transactionHash) {
+    console.error("Unexpected Paytaca response:", result);
+    throw new Error(
+      "Paytaca approved the payment, but the transaction ID was not returned.",
+    );
+  }
+
+  return transactionHash;
+}
+
+function getReadableError(error: unknown): string {
+  const visited = new WeakSet<object>();
+
+  const read = (value: unknown, depth = 0): string | null => {
+    if (depth > 5) return null;
+
+    if (value instanceof Error) {
+      return value.message || value.name;
+    }
+
+    if (typeof value === "string") {
+      return value.trim() || null;
+    }
+
+    if (
+      typeof value === "number" ||
+      typeof value === "boolean" ||
+      typeof value === "bigint"
+    ) {
+      return String(value);
+    }
+
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    if (visited.has(value)) {
+      return null;
+    }
+
+    visited.add(value);
+
+    const record = value as Record<string, unknown>;
+
+    const directKeys = [
+      "message",
+      "msg",
+      "reason",
+      "details",
+      "description",
+    ];
+
+    for (const key of directKeys) {
+      const candidate = read(record[key], depth + 1);
+
+      if (candidate) {
+        const code =
+          record.code ?? record.status ?? record.level;
+
+        return code !== undefined
+          ? `[${String(code)}] ${candidate}`
+          : candidate;
+      }
+    }
+
+    const nestedKeys = [
+      "error",
+      "data",
+      "cause",
+      "response",
+      "context",
+    ];
+
+    for (const key of nestedKeys) {
+      const candidate = read(record[key], depth + 1);
+      if (candidate) return candidate;
+    }
+
+    try {
+      return JSON.stringify(
+        value,
+        (_key, nestedValue) =>
+          typeof nestedValue === "bigint"
+            ? nestedValue.toString()
+            : nestedValue,
+      );
+    } catch {
+      return null;
+    }
+  };
+
+  return (
+    read(error) ??
+    "Could not complete the BCH ticket payment."
+  );
+}
+
 // Simulation mode ships ON by default: no chipnet faucet, Electrum uptime,
-// or Paytaca install required to demo the full seed -> buy -> draw -> resolve
+// or Paytaca install required to demo the buy -> draw flow.
 // flow. Flip it off to run the real thing against live chipnet.
 function loadInitialSimulationMode(): boolean {
   if (typeof window === "undefined") return true;
@@ -153,74 +298,15 @@ interface ResolvedDraw {
   simulated: boolean;
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++)
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return bytes;
-}
-
-function bytesToHexReversed(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .reverse()
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function doubleSha256(bytes: Uint8Array): Promise<Uint8Array> {
-  const first = await crypto.subtle.digest("SHA-256", bytes);
-  const second = await crypto.subtle.digest("SHA-256", first);
-  return new Uint8Array(second);
-}
-
-async function fetchChainHeight(): Promise<number> {
-  const tip = await (provider as any).performRequest(
-    "blockchain.headers.subscribe",
-  );
-  return tip.height;
-}
-
-async function fetchBlockHeader(height: number): Promise<string | null> {
-  try {
-    const res = await (provider as any).performRequest(
-      "blockchain.block.header",
-      height,
-    );
-    return typeof res === "string" ? res : res.hex;
-  } catch {
-    return null;
-  }
-}
-
-function bigIntFromLEBytes(bytes: Uint8Array): bigint {
-  let result = 0n;
-  for (let i = bytes.length - 1; i >= 0; i--) {
-    result = (result << 8n) | BigInt(bytes[i]);
-  }
-  return result;
-}
-
-function deriveWinningNumber(
-  rawDigest: Uint8Array,
-  maxTicketRange: number,
-): number {
-  const asInt = bigIntFromLEBytes(rawDigest);
-  const range = BigInt(maxTicketRange);
-  return Number((asInt % range) + 1n);
-}
-
-function winningNumberToDigits(
-  winningNumber: number,
-  pickCount: number,
-): number[] {
-  return String(winningNumber - 1)
-    .padStart(pickCount, "0")
-    .split("")
-    .map(Number);
-}
-
-function hasMinimalProofOfWork(rawDigest: Uint8Array): boolean {
-  return rawDigest[29] === 0 && rawDigest[30] === 0 && rawDigest[31] === 0;
+interface DrawHistoryItem {
+  id: string;
+  game: string;
+  numbers: number[];
+  jackpotSats: bigint;
+  hadWinner: boolean;
+  winnerCount: number;
+  drawnAt: string;
+  simulated: boolean;
 }
 
 export default function App() {
@@ -231,10 +317,6 @@ export default function App() {
     loadInitialSimulationMode,
   );
   const [simSlots, setSimSlots] = useState<Record<string, SimSlotState>>({});
-  // Editable jackpot seed amount for Simulation Mode (in BCH). No real funds
-  // involved, so this can be set arbitrarily high to demo big-jackpot UI states.
-  const [simSeedAmountBch, setSimSeedAmountBch] = useState<string>("1.0");
-
   useEffect(() => {
     localStorage.setItem(
       SIMULATION_MODE_STORAGE_KEY,
@@ -256,18 +338,27 @@ export default function App() {
   const [addressCopied, setAddressCopied] = useState(false);
   const [useLocalDemoWallet, setUseLocalDemoWallet] = useState(false);
 
-  // Effective active address/mode driving the game.
-  // Simulation Mode always wins when enabled — it never touches a real
-  // wallet or the network, regardless of what's connected underneath.
-  const activeAddress = simulationMode
+  // The bettor wallet is connected only when a user wants to buy a ticket.
+  // It is never used as the jackpot wallet.
+  const bettorAddress = simulationMode
     ? SIMULATED_ADDRESS
-    : (paytaca?.address ?? (useLocalDemoWallet ? wallet?.address : undefined));
-  const activeBalanceSats = simulationMode
+    : paytaca
+      ? normalizeChipnetAddress(paytaca.address)
+      : useLocalDemoWallet
+        ? wallet?.address
+        : undefined;
+  const bettorBalanceSats = simulationMode
     ? SIMULATED_BALANCE_SATS
     : paytaca
       ? paytacaBalanceSats
       : walletBalanceSats;
   const usingPaytaca = !simulationMode && !!paytaca;
+
+  const [jackpotBalanceSats, setJackpotBalanceSats] = useState<bigint>(0n);
+  const [jackpotBalanceLoading, setJackpotBalanceLoading] = useState(true);
+  const [jackpotBalanceError, setJackpotBalanceError] = useState<string | null>(
+    null,
+  );
 
   const copyAddress = async (address: string) => {
     try {
@@ -279,10 +370,14 @@ export default function App() {
     }
   };
 
-  const [selectedGameId, setSelectedGameId] = useState<string>("swertres");
+  const [selectedGameId, setSelectedGameId] = useState<string>("3d_lotto");
   const activeGame = LOTTO_GAMES[0];
 
   const [oracleKeypair] = useState<WalletKeypair>(() => generateWallet());
+
+  // One persistent CashScript address acts as the jackpot wallet.
+  // It starts empty. Every ticket purchase adds BCH to this address.
+  const jackpotWalletEpochRef = useRef<number>(Date.now());
 
   const contractCacheRef = useRef<Map<string, Contract>>(new Map());
   function getSlotContract(game: LottoGame, slotEpochMs: number): Contract {
@@ -307,6 +402,7 @@ export default function App() {
 
   const [selectedNumbers, setSelectedNumbers] = useState<number[]>([]);
   const [purchasedTickets, setPurchasedTickets] = useState<TicketItem[]>([]);
+  const [drawHistory, setDrawHistory] = useState<DrawHistoryItem[]>([]);
 
   const [lastWinningNumbers, setLastWinningNumbers] = useState<number[] | null>(
     null,
@@ -321,11 +417,14 @@ export default function App() {
   const [forceDrawPending, setForceDrawPending] = useState(false);
 
   const [txPending, setTxPending] = useState(false);
-  const [seedPending, setSeedPending] = useState(false);
   const [resolvePending, setResolvePending] = useState(false);
   const [drawPending, setDrawPending] = useState(false);
-  const [chainChecking, setChainChecking] = useState(false);
   const [chainError, setChainError] = useState<string | null>(null);
+  const [purchaseMessage, setPurchaseMessage] = useState<string | null>(null);
+  const [payoutPending, setPayoutPending] = useState(false);
+  const [payoutTxid, setPayoutTxid] = useState<string | null>(null);
+  const [pendingWinnerAddress, setPendingWinnerAddress] =
+    useState<string | null>(null);
 
   // "Round" replaces the old fixed-schedule slot: it's just an id (a
   // timestamp) that groups tickets + the contract UTXO together. It only
@@ -363,8 +462,18 @@ export default function App() {
   useEffect(() => {
     restorePaytacaSession()
       .then(({ connection, expiredStaleSession }) => {
-        if (connection) setPaytaca(connection);
-        if (expiredStaleSession) setPaytacaSessionExpired(true);
+        if (connection) {
+          const normalizedConnection: PaytacaConnection = {
+            ...connection,
+            address: normalizeChipnetAddress(connection.address),
+          };
+
+          setPaytaca(normalizedConnection);
+        }
+
+        if (expiredStaleSession) {
+          setPaytacaSessionExpired(true);
+        }
       })
       .catch((err) => {
         console.warn("Could not restore Paytaca session:", err);
@@ -374,12 +483,27 @@ export default function App() {
   const handleConnectPaytaca = async () => {
     setPaytacaConnecting(true);
     setWalletError(null);
+    setChainError(null);
     setPaytacaSessionExpired(false);
+
     try {
-      const conn = await connectPaytaca();
-      setPaytaca(conn);
+      const connection = await connectPaytaca();
+
+      const normalizedConnection: PaytacaConnection = {
+        ...connection,
+        address: normalizeChipnetAddress(connection.address),
+      };
+
+      setPaytaca(normalizedConnection);
+
+      const balance = await getWalletBalanceSats(
+        normalizedConnection.address,
+      );
+
+      setPaytacaBalanceSats(balance);
     } catch (err) {
       console.error("Paytaca connect failed:", err);
+
       setWalletError(
         err instanceof Error
           ? err.message
@@ -404,7 +528,9 @@ export default function App() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const bal = await getWalletBalanceSats(paytaca.address);
+        const bal = await getWalletBalanceSats(
+          normalizeChipnetAddress(paytaca.address),
+        );
         if (!cancelled) setPaytacaBalanceSats(bal);
       } catch (err) {
         console.warn("Paytaca balance poll failed:", err);
@@ -480,13 +606,16 @@ export default function App() {
     setWalletError(null);
   };
 
-  // --- Contract / jackpot pool balance polling (real chain, or local sim state) ---
+  // --- Jackpot wallet balance polling (CashScript address or local simulation) ---
 
   useEffect(() => {
     if (simulationMode) {
       // No network involved — read straight from local sim state.
       const entries = LOTTO_GAMES.map((game) => {
-        const key = simSlotKey(game.id, roundEpochMs);
+        const key = simSlotKey(
+          game.id,
+          jackpotWalletEpochRef.current,
+        );
         const state = simSlots[key] ?? emptySimSlot();
         return [game.id, state.contractSats] as const;
       });
@@ -501,7 +630,7 @@ export default function App() {
       const entries = await Promise.all(
         LOTTO_GAMES.map(async (game) => {
           try {
-            const contract = getSlotContract(game, roundEpochMs);
+            const contract = getSlotContract(game, jackpotWalletEpochRef.current);
             const utxos = await contract.getUtxos();
             const total = utxos.reduce(
               (sum, u) => sum + BigInt(u.satoshis),
@@ -527,6 +656,49 @@ export default function App() {
     };
   }, [selectedGameId, roundEpochMs, simulationMode, simSlots]);
 
+  // Poll the permanent jackpot wallet even when no bettor wallet is connected.
+  useEffect(() => {
+    if (simulationMode) {
+      setJackpotBalanceSats(activeContractSats);
+      setJackpotBalanceLoading(false);
+      setJackpotBalanceError(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    const pollJackpotBalance = async () => {
+      try {
+        const balance = await getWalletBalanceSats(JACKPOT_WALLET_ADDRESS);
+        if (cancelled) return;
+
+        setJackpotBalanceSats(balance);
+        setJackpotBalanceError(null);
+      } catch (error) {
+        if (cancelled) return;
+
+        console.warn("Jackpot wallet balance poll failed:", error);
+        setJackpotBalanceError(
+          error instanceof Error
+            ? error.message
+            : "Could not retrieve the jackpot wallet balance.",
+        );
+      } finally {
+        if (!cancelled) setJackpotBalanceLoading(false);
+      }
+    };
+
+    void pollJackpotBalance();
+    const intervalId = window.setInterval(() => {
+      void pollJackpotBalance();
+    }, 20_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [simulationMode, activeContractSats]);
+
   const handleSelectGame = (gameId: string) => {
     if (drawPending || forceDrawPending || gameId === selectedGameId) return;
     setSelectedGameId(gameId);
@@ -539,147 +711,152 @@ export default function App() {
     setRoundEpochMs(Date.now());
   };
 
-  // --- Draw resolution: only ever runs when forceDrawPending is set, i.e.
-  // when the user presses "Draw Now". No schedule, no polling for a future
-  // timestamp — betting stays open until this fires. ---
-
+  // --- Frontend-only draw resolution ---
   useEffect(() => {
-    if (!forceDrawPending || drawPending) return;
-    let cancelled = false;
-    const gameId = selectedGameId;
-    const slotEpochMs = roundEpochMs;
-    const game = LOTTO_GAMES[0];
+    if (!forceDrawPending || drawPending) {
+      return;
+    }
 
-    const runSimulatedDraw = () => {
-      const range = maxTicketRangeFor(game);
-      const sim = simulateDraw(gameId, slotEpochMs, range, game.pickCount);
+    try {
+      const numbers = simulationMode
+        ? simulateDraw(
+            selectedGameId,
+            roundEpochMs,
+            maxTicketRangeFor(activeGame),
+            activeGame.pickCount,
+          ).numbers
+        : generateFrontendDraw(
+            activeGame.pickCount,
+            activeGame.maxNumber,
+          );
 
-      drawingGameIdRef.current = gameId;
-      drawingSlotEpochRef.current = slotEpochMs;
+      const winningNumber = Number(
+        digitsToPickedNumber(
+          numbers,
+          activeGame.maxNumber,
+        ),
+      );
+
+      drawingGameIdRef.current =
+        selectedGameId;
+
+      drawingSlotEpochRef.current =
+        roundEpochMs;
 
       setResolvedDraw({
-        gameId: sim.gameId,
-        slotEpochMs: sim.slotEpochMs,
-        blockHeight: sim.blockHeight,
-        blockHash: sim.blockHash,
+        gameId: selectedGameId,
+        slotEpochMs: roundEpochMs,
+        blockHeight: 0,
+        blockHash:
+          typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : Array.from(
+                crypto.getRandomValues(
+                  new Uint8Array(16),
+                ),
+              )
+                .map((value) =>
+                  value
+                    .toString(16)
+                    .padStart(2, "0"),
+                )
+                .join(""),
         headerHex: "",
-        winningNumber: sim.winningNumber,
-        numbers: sim.numbers,
-        simulated: true,
+        winningNumber,
+        numbers,
+        simulated: simulationMode,
       });
+
       setDrawMessage(null);
       setLastWinningNumbers(null);
       setResolveTxid(null);
       setForceDrawPending(false);
       setDrawPending(true);
-    };
+    } catch (error) {
+      const message = getReadableError(error);
 
-    const runLiveDraw = async () => {
-      try {
-        setChainChecking(true);
-        setChainError(null);
+      console.error(
+        "Frontend draw failed:",
+        message,
+        error,
+      );
 
-        // "Draw anytime" = derive randomness from the current chain tip
-        // (walking back to the most recent block with minimal proof-of-work)
-        // instead of waiting for a future block at a scheduled timestamp.
-        const tipHeight = await fetchChainHeight();
-        let height = tipHeight;
-        let found: {
-          header: string;
-          height: number;
-          rawDigest: Uint8Array;
-        } | null = null;
-
-        for (let i = 0; i < 20 && !cancelled && height >= 0; i++) {
-          const header = await fetchBlockHeader(height);
-          if (!header) break;
-          const rawDigest = await doubleSha256(hexToBytes(header));
-          if (hasMinimalProofOfWork(rawDigest)) {
-            found = { header, height, rawDigest };
-            break;
-          }
-          height--;
-        }
-
-        if (cancelled) return;
-
-        if (!found) {
-          setChainError("No qualifying block found right now — try again.");
-          setForceDrawPending(false);
-          return;
-        }
-
-        const blockHash = bytesToHexReversed(found.rawDigest);
-        const range = maxTicketRangeFor(game);
-
-        // Winning number is derived purely from the block hash — this is
-        // the whole point of the design: anyone can independently
-        // recompute this from public chain data and verify the draw wasn't
-        // rigged. It must never be overridden to favor a particular ticket.
-        const winningNumber = deriveWinningNumber(found.rawDigest, range);
-        const numbers = winningNumberToDigits(winningNumber, game.pickCount);
-
-        drawingGameIdRef.current = gameId;
-        drawingSlotEpochRef.current = slotEpochMs;
-
-        setResolvedDraw({
-          gameId,
-          slotEpochMs,
-          blockHeight: found.height,
-          blockHash,
-          headerHex: found.header,
-          winningNumber,
-          numbers,
-          simulated: false,
-        });
-        setDrawMessage(null);
-        setLastWinningNumbers(null);
-        setResolveTxid(null);
-        setForceDrawPending(false);
-        setDrawPending(true);
-      } catch (err) {
-        console.warn("Live draw failed:", err);
-        if (!cancelled) {
-          setChainError("Could not reach the chain — try again.");
-          setForceDrawPending(false);
-        }
-      } finally {
-        if (!cancelled) setChainChecking(false);
-      }
-    };
-
-    if (simulationMode) runSimulatedDraw();
-    else runLiveDraw();
-
-    return () => {
-      cancelled = true;
-    };
+      setChainError(message);
+      setForceDrawPending(false);
+      setDrawPending(false);
+    }
   }, [
     forceDrawPending,
     drawPending,
     roundEpochMs,
     selectedGameId,
     simulationMode,
+    activeGame,
   ]);
 
-  const toggleNumber = (num: number) => {
-    if (selectedNumbers.length < activeGame.pickCount) {
-      setSelectedNumbers([...selectedNumbers, num]);
-    }
-  };
 
-  const handleQuickPick = () => {
-    const numbers: number[] = [];
-    for (let i = 0; i < activeGame.pickCount; i++) {
-      const randomNum = Math.floor(Math.random() * (activeGame.maxNumber + 1));
-      numbers.push(randomNum);
+const toggleNumber = (num: number) => {
+  if (bettingClosed) return;
+
+  setSelectedNumbers((previousNumbers) => {
+    if (previousNumbers.length >= activeGame.pickCount) {
+      return previousNumbers;
     }
-    setSelectedNumbers(numbers);
-  };
+
+    // Duplicate numbers are intentionally allowed.
+    // Examples: 5-5-2 and 0-0-0.
+    return [...previousNumbers, num];
+  });
+};
+
+const removeSelectedNumber = (indexToRemove: number) => {
+  if (bettingClosed) return;
+
+  setSelectedNumbers((previousNumbers) =>
+    previousNumbers.filter(
+      (_, currentIndex) => currentIndex !== indexToRemove,
+    ),
+  );
+};
+
+const getOrdinalLabel = (index: number): string => {
+  const position = index + 1;
+
+  if (position % 100 >= 11 && position % 100 <= 13) {
+    return `${position}th`;
+  }
+
+  switch (position % 10) {
+    case 1:
+      return `${position}st`;
+
+    case 2:
+      return `${position}nd`;
+
+    case 3:
+      return `${position}rd`;
+
+    default:
+      return `${position}th`;
+  }
+};
+
+const handleQuickPick = () => {
+  const numbers = Array.from(
+    { length: activeGame.pickCount },
+    () =>
+      Math.floor(
+        Math.random() *
+          (activeGame.maxNumber + 1),
+      ),
+  );
+
+  setSelectedNumbers(numbers);
+};
 
   // Betting only closes for the moment a draw is actually in flight —
   // otherwise you can buy tickets whenever you like.
-  const bettingClosed = drawPending || forceDrawPending;
+  const bettingClosed = drawPending || forceDrawPending || payoutPending;
 
   const handleForceDrawNow = () => {
     if (drawPending || forceDrawPending) return;
@@ -705,6 +882,7 @@ export default function App() {
   const handleResetSimulation = () => {
     setSimSlots({});
     setPurchasedTickets((prev) => prev.filter((t) => !t.simulated));
+    setDrawHistory((prev) => prev.filter((draw) => !draw.simulated));
     setChainError(null);
     setDrawMessage(null);
     setResolvedDraw(null);
@@ -715,157 +893,192 @@ export default function App() {
     setRoundEpochMs(Date.now());
   };
 
-  const handleSeedContract = async () => {
-    setSeedPending(true);
-    setChainError(null);
-    try {
-      if (simulationMode) {
-        const seedSats = bchStringToSats(simSeedAmountBch);
-        if (seedSats === null) {
-          throw new Error("Enter a valid seed amount in BCH (e.g. 1.0).");
-        }
-        const key = simSlotKey(activeGame.id, roundEpochMs);
-        setSimSlots((prev) => ({
-          ...prev,
-          [key]: simSeed(prev[key] ?? emptySimSlot(), seedSats),
-        }));
-        return;
+  const refreshBalancesAfterPurchase = (
+    buyerAddress: string | undefined,
+    paidWithPaytaca: boolean,
+  ) => {
+    // Do not block the successful purchase UI while Electrum indexes the tx.
+    window.setTimeout(() => {
+      if (buyerAddress) {
+        void getWalletBalanceSats(buyerAddress)
+          .then((balance) => {
+            if (paidWithPaytaca) {
+              setPaytacaBalanceSats(balance);
+            } else {
+              setWalletBalanceSats(balance);
+            }
+          })
+          .catch((error) => {
+            console.warn("Buyer balance refresh failed:", error);
+          });
       }
 
-      const contract = getSlotContract(activeGame, roundEpochMs);
-
-      if (paytaca) {
-        await seedContractViaPaytaca(
-          contract,
-          activeGame.ticketPriceSats,
-          paytaca.address,
-        );
-        const bal = await getWalletBalanceSats(paytaca.address);
-        setPaytacaBalanceSats(bal);
-      } else if (wallet) {
-        await chainSeedContract(
-          contract,
-          activeGame.ticketPriceSats,
-          wallet.privateKey,
-          wallet.address,
-        );
-        const bal = await getWalletBalanceSats(wallet.address);
-        setWalletBalanceSats(bal);
-      } else {
-        throw new Error("Connect a wallet first.");
-      }
-    } catch (err) {
-      console.error("Seed failed:", err);
-      setChainError(
-        err instanceof Error ? err.message : "Could not seed contract.",
-      );
-    } finally {
-      setSeedPending(false);
-    }
+      void getWalletBalanceSats(JACKPOT_WALLET_ADDRESS)
+        .then((balance) => {
+          setJackpotBalanceSats(balance);
+          setJackpotBalanceError(null);
+        })
+        .catch((error) => {
+          console.warn("Jackpot balance refresh failed:", error);
+        });
+    }, 1200);
   };
 
   const handleBuyTicket = async () => {
-    if (!activeAddress || selectedNumbers.length !== activeGame.pickCount)
+    if (!bettorAddress) {
+      setChainError("Connect your bettor wallet first.");
       return;
+    }
+
+    if (selectedNumbers.length !== activeGame.pickCount) {
+      setChainError(`Select exactly ${activeGame.pickCount} numbers.`);
+      return;
+    }
+
+    const purchasedNumbers = [...selectedNumbers];
+    const pickedNumber = digitsToPickedNumber(
+      purchasedNumbers,
+      activeGame.maxNumber,
+    );
+
     setTxPending(true);
     setChainError(null);
-    try {
-      // Combine the picked digits into the single number the contract's
-      // pickedNumber/winningNumber commitment scheme expects.
-      const pickedNumber = digitsToPickedNumber(selectedNumbers);
+    setPurchaseMessage(null);
 
+    try {
       let txid: string;
-      let ticketAddress: string;
+      let paymentAddress: string;
+      let normalizedBuyerAddress: string | undefined;
+      let paidWithPaytaca = false;
 
       if (simulationMode) {
-        const key = simSlotKey(activeGame.id, roundEpochMs);
-        setSimSlots((prev) => ({
-          ...prev,
+        const key = simSlotKey(
+          activeGame.id,
+          jackpotWalletEpochRef.current,
+        );
+
+        setSimSlots((previousSlots) => ({
+          ...previousSlots,
           [key]: simBuyTicket(
-            prev[key] ?? emptySimSlot(),
+            previousSlots[key] ?? emptySimSlot(),
             activeGame.ticketPriceSats,
-            selectedNumbers,
+            purchasedNumbers,
             pickedNumber,
           ),
         }));
-        txid = fakeTxid();
-        ticketAddress = "simulated (no real contract)";
-      } else {
-        const contract = getSlotContract(activeGame, roundEpochMs);
 
-        if (paytaca) {
-          const buyerPkHash = pkHashFromAddress(paytaca.address);
-          const result = await buyTicketViaPaytaca(
-            contract,
-            activeGame.ticketPriceSats,
-            paytaca.address,
-            buyerPkHash,
-            pickedNumber,
-          );
-          txid = result.signedTransactionHash;
-        } else if (wallet) {
-          const result = await chainBuyTicket(
-            contract,
-            activeGame.ticketPriceSats,
-            wallet.pkHash,
-            pickedNumber,
-            wallet.privateKey,
-            wallet.address,
-          );
-          txid = result.txid;
-        } else {
-          throw new Error("Connect a wallet first.");
-        }
-        ticketAddress = contract.address;
+        txid = fakeTxid();
+        paymentAddress = "simulated jackpot wallet";
+
+        // Immediate optimistic jackpot update in simulation mode.
+        setJackpotBalanceSats(
+          (previousBalance) =>
+            previousBalance + activeGame.ticketPriceSats,
+        );
+      } else if (paytaca) {
+        normalizedBuyerAddress =
+          normalizeChipnetAddress(paytaca.address);
+        paidWithPaytaca = true;
+
+        const buyerPkHash = pkHashFromAddress(
+          normalizedBuyerAddress,
+        );
+
+        const result = await buyTicketViaPaytaca(
+          JACKPOT_WALLET_ADDRESS,
+          activeGame.ticketPriceSats,
+          normalizedBuyerAddress,
+          buyerPkHash,
+          pickedNumber,
+        );
+
+        txid = getPaytacaTransactionHash(result);
+        paymentAddress = JACKPOT_WALLET_ADDRESS;
+
+        // The transaction was broadcast successfully. Update the visible jackpot
+        // immediately rather than waiting for Electrum to index the new output.
+        setJackpotBalanceSats(
+          (previousBalance) =>
+            previousBalance + activeGame.ticketPriceSats,
+        );
+      } else if (wallet) {
+        normalizedBuyerAddress = wallet.address;
+
+        const result = await chainBuyTicket(
+          JACKPOT_WALLET_ADDRESS,
+          activeGame.ticketPriceSats,
+          wallet.pkHash,
+          pickedNumber,
+          wallet.privateKey,
+          wallet.address,
+        );
+
+        txid = result.txid;
+        paymentAddress = JACKPOT_WALLET_ADDRESS;
+
+        setJackpotBalanceSats(
+          (previousBalance) =>
+            previousBalance + activeGame.ticketPriceSats,
+        );
+      } else {
+        throw new Error("Connect your bettor wallet first.");
       }
 
       const newTicket: TicketItem = {
-        id: Math.random().toString(36).substring(2, 9),
+        id: crypto.randomUUID?.() ??
+          Math.random().toString(36).substring(2, 9),
         game: activeGame.name,
         gameId: activeGame.id,
         slotEpochMs: roundEpochMs,
-        numbers: [...selectedNumbers],
+        numbers: purchasedNumbers,
         txid,
-        address: ticketAddress,
+        buyerAddress:
+          normalizedBuyerAddress ??
+          bettorAddress,
+        paymentAddress,
         amountSats: activeGame.ticketPriceSats,
         timestamp: new Date().toLocaleTimeString(),
         simulated: simulationMode,
       };
 
-      setPurchasedTickets([newTicket, ...purchasedTickets]);
+      // Update the ticket list and form immediately after broadcast.
+      setPurchasedTickets((previousTickets) => [
+        newTicket,
+        ...previousTickets,
+      ]);
       setSelectedNumbers([]);
+      setPurchaseMessage(
+        `Ticket ${purchasedNumbers.join("-")} purchased successfully.`,
+      );
 
+      // Balance reads are slower and may briefly return the pre-transaction
+      // values, so refresh them in the background after a short indexing delay.
       if (!simulationMode) {
-        if (paytaca) {
-          const bal = await getWalletBalanceSats(paytaca.address);
-          setPaytacaBalanceSats(bal);
-        } else if (wallet) {
-          const bal = await getWalletBalanceSats(wallet.address);
-          setWalletBalanceSats(bal);
-        }
-
-        const contract = getSlotContract(activeGame, roundEpochMs);
-        const utxos = await contract.getUtxos();
-        const total = utxos.reduce((sum, u) => sum + BigInt(u.satoshis), 0n);
-        setActiveContractSats(total);
+        refreshBalancesAfterPurchase(
+          normalizedBuyerAddress,
+          paidWithPaytaca,
+        );
       }
     } catch (err) {
-      console.error("Buy ticket failed:", err);
-      setChainError(
-        err instanceof Error ? err.message : "Could not buy ticket on-chain.",
-      );
+      const message = getReadableError(err);
+      console.error("Buy ticket failed:", message, err);
+      setChainError(message);
+      setPurchaseMessage(null);
     } finally {
       setTxPending(false);
     }
   };
 
   const handleResolveOnChain = async () => {
-    if (!resolvedDraw || !activeAddress) return;
+    if (!resolvedDraw || !bettorAddress) return;
     setResolvePending(true);
     setChainError(null);
     try {
       if (simulationMode) {
-        const key = simSlotKey(resolvedDraw.gameId, resolvedDraw.slotEpochMs);
+        const key = simSlotKey(
+          resolvedDraw.gameId,
+          jackpotWalletEpochRef.current,
+        );
         setSimSlots((prev) => ({
           ...prev,
           [key]: simResolve(prev[key] ?? emptySimSlot()),
@@ -874,7 +1087,10 @@ export default function App() {
         return;
       }
 
-      const contract = getSlotContract(activeGame, resolvedDraw.slotEpochMs);
+      const contract = getSlotContract(
+        activeGame,
+        jackpotWalletEpochRef.current,
+      );
 
       const { oracleSig, oracleMessage } = await signOracleWinningNumber(
         oracleKeypair.privateKey,
@@ -884,16 +1100,21 @@ export default function App() {
       let txid: string;
 
       if (paytaca) {
-        const winnerPkHash = pkHashFromAddress(paytaca.address);
+        const normalizedWinnerAddress =
+          normalizeChipnetAddress(paytaca.address);
+
+        const winnerPkHash = pkHashFromAddress(
+          normalizedWinnerAddress,
+        );
         const result = await resolveDrawViaPaytaca(
           contract,
           oracleSig,
           oracleMessage,
-          paytaca.address,
+          normalizedWinnerAddress,
           winnerPkHash,
           resolvedDraw.winningNumber,
         );
-        txid = result.signedTransactionHash;
+        txid = getPaytacaTransactionHash(result);
       } else if (wallet) {
         txid = await chainResolveDraw(
           contract,
@@ -905,7 +1126,7 @@ export default function App() {
           wallet.privateKey,
         );
       } else {
-        throw new Error("Connect a wallet first.");
+        throw new Error("Connect your bettor wallet first.");
       }
 
       setResolveTxid(txid);
@@ -921,10 +1142,120 @@ export default function App() {
     }
   };
 
-  // The draw machine passes the exact digits it animated to/revealed
-  // (see LotteryDrawMachine's onComplete callback) — those are guaranteed
-  // to match resolvedDraw.numbers because we feed them in as forcedResult,
-  // so we use what's handed back here directly instead of a separate ref.
+  const handleAutomaticWinnerPayout = async (
+    winnerAddress: string,
+    expectedJackpotSats: bigint,
+  ) => {
+    setPendingWinnerAddress(
+      winnerAddress,
+    );
+    setPayoutTxid(null);
+
+    if (simulationMode) {
+      const simulatedTxid = fakeTxid();
+
+      setPayoutTxid(simulatedTxid);
+      setJackpotBalanceSats(0n);
+      setDrawMessage(
+        `Simulated jackpot sent to ${winnerAddress}.`,
+      );
+      setPendingWinnerAddress(null);
+      return;
+    }
+
+    if (!paytaca) {
+      setChainError(
+        "A winning ticket was found, but the jackpot Paytaca wallet is not connected. Connect the jackpot wallet to complete the payout.",
+      );
+      return;
+    }
+
+    const connectedSignerAddress =
+      normalizeChipnetAddress(
+        paytaca.address,
+      );
+
+    const normalizedJackpotAddress =
+      normalizeChipnetAddress(
+        JACKPOT_WALLET_ADDRESS,
+      );
+
+    if (
+      connectedSignerAddress !==
+      normalizedJackpotAddress
+    ) {
+      setChainError(
+        `Winner detected, but the connected Paytaca wallet cannot spend the jackpot. Connect ${normalizedJackpotAddress} to send the prize.`,
+      );
+      return;
+    }
+
+    if (expectedJackpotSats <= 0n) {
+      setChainError(
+        "Winner detected, but the jackpot balance is empty.",
+      );
+      return;
+    }
+
+    setPayoutPending(true);
+    setChainError(null);
+
+    try {
+      /**
+       * This immediately opens Paytaca's normal transaction confirmation.
+       * There is no extra organizer approval button in the web application.
+       */
+      const result =
+        await payWinnerViaPaytaca(
+          normalizedJackpotAddress,
+          winnerAddress,
+        );
+
+      const txid =
+        getPaytacaTransactionHash(
+          result,
+        );
+
+      setPayoutTxid(txid);
+      setJackpotBalanceSats(0n);
+      setPendingWinnerAddress(null);
+      setDrawMessage(
+        `Jackpot sent successfully to ${winnerAddress}.`,
+      );
+
+      window.setTimeout(() => {
+        void getWalletBalanceSats(
+          normalizedJackpotAddress,
+        )
+          .then((balance) => {
+            setJackpotBalanceSats(
+              balance,
+            );
+          })
+          .catch((error) => {
+            console.warn(
+              "Jackpot balance refresh after payout failed:",
+              error,
+            );
+          });
+      }, 1500);
+    } catch (error) {
+      const message =
+        getReadableError(error);
+
+      console.error(
+        "Automatic jackpot payout failed:",
+        message,
+        error,
+      );
+
+      setChainError(message);
+    } finally {
+      setPayoutPending(false);
+    }
+  };
+
+  // The draw machine passes the exact digits it animated to/revealed.
   const handleDrawComplete = (winning: number[]) => {
     setLastWinningNumbers(winning);
     setDrawPending(false);
@@ -933,41 +1264,85 @@ export default function App() {
     const slotEpoch = drawingSlotEpochRef.current;
 
     const slotTickets = purchasedTickets.filter(
-      (t) => t.gameId === gameId && t.slotEpochMs === slotEpoch,
+      (ticket) =>
+        ticket.gameId === gameId &&
+        ticket.slotEpochMs === slotEpoch,
     );
 
-    let anyMatch = false;
-    for (const t of slotTickets) {
-      const match =
-        t.numbers.length === winning.length &&
-        t.numbers.every((n, i) => n === winning[i]);
-      if (match) {
-        anyMatch = true;
-        break;
-      }
-    }
+    const matchingTickets = slotTickets.filter(
+      (ticket) =>
+        ticket.numbers.length === winning.length &&
+        ticket.numbers.every(
+          (number, index) => number === winning[index],
+        ),
+    );
 
-    if (forceWinMode || anyMatch) {
+    const hadWinner = forceWinMode || matchingTickets.length > 0;
+    const winnerCount = forceWinMode
+      ? Math.max(1, matchingTickets.length)
+      : matchingTickets.length;
+    const completedJackpotSats = jackpotBalanceSats;
+    const nextRoundEpochMs = Date.now();
+
+    setDrawHistory((previousHistory) => [
+      {
+        id: `${gameId}-${slotEpoch}`,
+        game: activeGame.name,
+        numbers: [...winning],
+        jackpotSats: completedJackpotSats,
+        hadWinner,
+        winnerCount,
+        drawnAt: new Date().toLocaleString(),
+        simulated: simulationMode,
+      },
+      ...previousHistory,
+    ]);
+
+    if (hadWinner) {
       const calcPhp = bchToPhpRate
-        ? ((Number(activeContractSats) / 1e8) * bchToPhpRate).toLocaleString(
-            undefined,
-            { maximumFractionDigits: 2 },
-          )
+        ? (
+            (Number(completedJackpotSats) / 1e8) *
+            bchToPhpRate
+          ).toLocaleString(undefined, {
+            maximumFractionDigits: 2,
+          })
         : "12,500.00";
+
       setWonPrizePhp(calcPhp);
       setShowPopupCelebration(true);
-      setDrawMessage(
-        `🎉 JACKPOT! Your ticket matched the winning combination!`,
-      );
+
+      const winningTicket =
+        matchingTickets[0];
+
+      const winnerAddress =
+        winningTicket?.buyerAddress ??
+        bettorAddress;
+
+      if (!winnerAddress) {
+        setChainError(
+          "A winning ticket was found, but its wallet address is unavailable.",
+        );
+      } else {
+        setDrawMessage(
+          "🎉 JACKPOT! Sending the prize to the winning wallet...",
+        );
+
+        void handleAutomaticWinnerPayout(
+          winnerAddress,
+          completedJackpotSats,
+        );
+      }
     } else {
+      // No transfer is required. The BCH remains in the same jackpot wallet.
       setDrawMessage(
-        `Draw complete. Winning numbers: ${winning.join(" - ")}. Better luck next time!`,
+        `No winner. ${bchPriceFormatted(
+          completedJackpotSats,
+        )} remains in the jackpot wallet for the next draw.`,
       );
     }
 
-    // Start a fresh round so the next batch of tickets is grouped
-    // separately from the one that just resolved.
-    setRoundEpochMs(Date.now());
+    // A new round prevents old tickets from participating again.
+    setRoundEpochMs(nextRoundEpochMs);
   };
 
   const bchPriceFormatted = (sats: bigint) => {
@@ -991,7 +1366,7 @@ export default function App() {
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-emerald-400 to-teal-200 bg-clip-text text-transparent">
-                PCSO Swertres Lotto on Bitcoin Cash
+                3D Lotto on Bitcoin Cash
               </h1>
               {simulationMode && (
                 <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-amber-300 bg-amber-950/50 border border-amber-800/60 px-2 py-0.5 rounded-full">
@@ -1000,11 +1375,6 @@ export default function App() {
                 </span>
               )}
             </div>
-            <p className="text-xs text-slate-400">
-              {simulationMode
-                ? "Running fully offline — no chipnet, faucet, or wallet required"
-                : "Decentralized Digit Games on Chipnet"}
-            </p>
           </div>
         </div>
 
@@ -1128,14 +1498,39 @@ export default function App() {
                 <div>
                   <div className="text-[10px] uppercase font-bold text-slate-400 flex items-center">
                     <Banknote className="w-3 h-3 mr-1 text-emerald-400" />
-                    Slot Jackpot Pool
+                    Current Jackpot
                   </div>
                   <div className="text-lg font-bold text-emerald-400 mt-0.5">
-                    {bchPriceFormatted(activeContractSats)}
+                    {jackpotBalanceLoading
+                      ? "Loading..."
+                      : bchPriceFormatted(jackpotBalanceSats)}
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    {phpPriceFormatted(activeContractSats)}
+                    {jackpotBalanceLoading
+                      ? "₱..."
+                      : phpPriceFormatted(jackpotBalanceSats)}
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => copyAddress(JACKPOT_WALLET_ADDRESS)}
+                    className="mt-1 flex max-w-[240px] items-center gap-1 font-mono text-[9px] text-slate-500 hover:text-emerald-400"
+                    title={JACKPOT_WALLET_ADDRESS}
+                  >
+                    <span className="truncate">{JACKPOT_WALLET_ADDRESS}</span>
+                    {addressCopied ? (
+                      <Check className="h-3 w-3 shrink-0 text-emerald-400" />
+                    ) : (
+                      <Copy className="h-3 w-3 shrink-0" />
+                    )}
+                  </button>
+                  {jackpotBalanceError && !simulationMode && (
+                    <div
+                      className="mt-1 max-w-[240px] text-[9px] text-red-400"
+                      title={jackpotBalanceError}
+                    >
+                      Jackpot balance temporarily unavailable
+                    </div>
+                  )}
                 </div>
 
                 <div className="border-l border-slate-800 pl-6">
@@ -1156,9 +1551,8 @@ export default function App() {
                 active={drawPending}
                 pickCount={activeGame.pickCount}
                 maxDigit={activeGame.maxNumber}
-                // Feed the machine the already-resolved numbers so the
-                // animation reveals exactly what resolveDraw() will pay
-                // out against, instead of picking its own random result.
+                // Feed the machine the already-generated frontend result so
+                // the animation reveals the exact winning digits.
                 forcedResult={resolvedDraw ? resolvedDraw.numbers : undefined}
                 onComplete={handleDrawComplete}
               />
@@ -1166,6 +1560,101 @@ export default function App() {
               {drawMessage && (
                 <div className="mt-4 text-sm font-medium text-center text-emerald-300 bg-emerald-950/40 border border-emerald-800/60 px-4 py-2 rounded-xl animate-fade-in">
                   {drawMessage}
+                </div>
+              )}
+
+              {payoutPending && pendingWinnerAddress && (
+                <div className="mt-3 rounded-xl border border-amber-800/60 bg-amber-950/30 px-4 py-3 text-center text-xs text-amber-300">
+                  Confirm the jackpot transfer in Paytaca.
+                  <div className="mt-1 break-all font-mono text-[10px] text-amber-200">
+                    Winner: {pendingWinnerAddress}
+                  </div>
+                </div>
+              )}
+
+              {payoutTxid && (
+                <div className="mt-3 rounded-xl border border-emerald-800/60 bg-emerald-950/30 px-4 py-3 text-center text-xs text-emerald-300">
+                  Jackpot payout broadcast successfully.
+                  <div className="mt-1 break-all font-mono text-[10px] text-emerald-200">
+                    Txid: {payoutTxid}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mb-6 overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
+              <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+                <h3 className="flex items-center text-sm font-bold uppercase tracking-wider text-slate-300">
+                  <Trophy className="mr-2 h-4 w-4 text-emerald-400" />
+                  Draw Result History
+                </h3>
+                <span className="text-[10px] text-slate-500">
+                  {drawHistory.length} draw{drawHistory.length === 1 ? "" : "s"}
+                </span>
+              </div>
+
+              {drawHistory.length === 0 ? (
+                <div className="px-4 py-8 text-center text-xs text-slate-500">
+                  Completed draw results will appear here.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[680px] text-left text-xs">
+                    <thead className="bg-slate-900/80 text-[10px] uppercase tracking-wider text-slate-400">
+                      <tr>
+                        <th className="px-4 py-3 font-bold">Drawn At</th>
+                        <th className="px-4 py-3 font-bold">Result</th>
+                        <th className="px-4 py-3 font-bold">Jackpot</th>
+                        <th className="px-4 py-3 font-bold">Outcome</th>
+                        <th className="px-4 py-3 font-bold">Mode</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800">
+                      {drawHistory.map((draw) => (
+                        <tr key={draw.id} className="text-slate-300">
+                          <td className="whitespace-nowrap px-4 py-3 text-slate-400">
+                            {draw.drawnAt}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-1.5">
+                              {draw.numbers.map((number, index) => (
+                                <span
+                                  key={`${draw.id}-${index}`}
+                                  className="flex h-7 w-7 items-center justify-center rounded-lg border border-emerald-800/60 bg-emerald-950/40 font-mono font-bold text-emerald-300"
+                                >
+                                  {number}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="whitespace-nowrap px-4 py-3">
+                            <div className="font-mono font-bold text-white">
+                              {bchPriceFormatted(draw.jackpotSats)}
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                              {phpPriceFormatted(draw.jackpotSats)}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span
+                              className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase ${
+                                draw.hadWinner
+                                  ? "border-emerald-800/60 bg-emerald-950/50 text-emerald-300"
+                                  : "border-amber-800/60 bg-amber-950/40 text-amber-300"
+                              }`}
+                            >
+                              {draw.hadWinner
+                                ? `${draw.winnerCount} winner${draw.winnerCount === 1 ? "" : "s"}`
+                                : "Rolled over"}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-slate-400">
+                            {draw.simulated ? "Simulation" : "Live"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </div>
@@ -1178,20 +1667,20 @@ export default function App() {
                     <span className="text-sm font-bold text-white">
                       {resolvedDraw.simulated
                         ? "Simulated Draw Ready to Resolve"
-                        : "Chain Draw Ready to Resolve"}
+                        : "Frontend Draw Ready"}
                     </span>
                   </div>
                   <span className="text-xs font-mono text-emerald-400 bg-emerald-900/40 px-2 py-0.5 rounded">
                     {resolvedDraw.simulated
                       ? "Simulated"
-                      : `Block #${resolvedDraw.blockHeight}`}
+                      : "Frontend RNG"}
                   </span>
                 </div>
                 <p className="text-xs text-slate-300">
                   Winning numbers{" "}
                   {resolvedDraw.simulated
                     ? "generated locally"
-                    : "derived from block hash"}
+                    : "generated securely in this browser"}
                   :{" "}
                   <strong className="text-white">
                     {resolvedDraw.numbers.join(" - ")}
@@ -1200,7 +1689,7 @@ export default function App() {
                 <div className="flex items-center space-x-3 pt-1">
                   <Button
                     onClick={handleResolveOnChain}
-                    disabled={resolvePending || !activeAddress}
+                    disabled={resolvePending || !bettorAddress}
                     className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs h-8 px-4 rounded-lg"
                   >
                     {resolvePending
@@ -1220,125 +1709,303 @@ export default function App() {
               </div>
             )}
 
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center">
-                  <Ticket className="w-4 h-4 mr-2 text-emerald-400" />
-                  Select Your Numbers ({selectedNumbers.length}/
-                  {activeGame.pickCount})
-                </h3>
-                <div className="flex items-center space-x-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={handleQuickPick}
-                    disabled={bettingClosed}
-                    className="border-slate-700 bg-slate-800/40 text-xs h-8 text-slate-300 hover:bg-slate-800"
-                  >
-                    <Zap className="w-3 h-3 mr-1 text-amber-400" />
-                    Quick Pick
-                  </Button>
-                  {selectedNumbers.length > 0 && (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setSelectedNumbers([])}
-                      disabled={bettingClosed}
-                      className="text-xs h-8 text-slate-400 hover:text-red-400"
-                    >
-                      Clear
-                    </Button>
-                  )}
-                </div>
-              </div>
 
-              <div className="grid grid-cols-5 sm:grid-cols-10 gap-2">
-                {Array.from({ length: activeGame.maxNumber + 1 }, (_, i) => {
-                  const isSelected = selectedNumbers.includes(i);
-                  return (
-                    <button
-                      key={i}
-                      onClick={() => toggleNumber(i)}
-                      disabled={bettingClosed}
-                      className={`h-12 rounded-xl font-mono font-bold text-base transition-all flex items-center justify-center border ${
-                        isSelected
-                          ? "bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-900/40 scale-105"
-                          : "bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-800/40"
-                      } ${bettingClosed ? "opacity-50 cursor-not-allowed" : ""}`}
-                    >
-                      {i}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="pt-4 flex flex-col sm:flex-row items-center justify-between gap-4 border-t border-slate-800">
-                <div>
-                  <div className="text-xs text-slate-400">Ticket Price</div>
-                  <div className="text-base font-bold text-white">
-                    {bchPriceFormatted(activeGame.ticketPriceSats)}{" "}
-                    <span className="text-xs font-normal text-slate-400">
-                      ({phpPriceFormatted(activeGame.ticketPriceSats)})
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex items-center space-x-3 w-full sm:w-auto">
-                  {activeContractSats === 0n && (
-                    <Button
-                      onClick={handleSeedContract}
-                      disabled={seedPending || !activeAddress}
-                      variant="outline"
-                      className="border-slate-700 bg-slate-800/40 text-xs h-11 px-4 rounded-xl text-slate-300 hover:bg-slate-800"
-                    >
-                      {seedPending
-                        ? usingPaytaca
-                          ? "Confirm in Paytaca..."
-                          : "Seeding..."
-                        : "Seed Contract"}
-                    </Button>
-                  )}
-
-                  <Button
-                    onClick={handleBuyTicket}
-                    disabled={
-                      txPending ||
-                      bettingClosed ||
-                      !activeAddress ||
-                      selectedNumbers.length !== activeGame.pickCount
-                    }
-                    className="flex-1 sm:flex-none bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm h-11 px-8 rounded-xl shadow-lg shadow-emerald-900/40 disabled:opacity-50"
-                  >
-                    {txPending
-                      ? usingPaytaca
-                        ? "Confirm in Paytaca..."
-                        : "Purchasing..."
-                      : bettingClosed
-                        ? "Betting Closed"
-                        : !activeAddress
-                          ? "Connect a Wallet First"
-                          : "Buy Ticket On-Chain"}
-                  </Button>
-                </div>
-              </div>
-
-              {chainError && (
-                <div className="text-xs text-red-400 bg-red-950/40 border border-red-900/60 p-3 rounded-xl flex items-center space-x-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0" />
-                  <span>{chainError}</span>
-                </div>
-              )}
-              {walletError && (
-                <div className="text-xs text-red-400 bg-red-950/40 border border-red-900/60 p-3 rounded-xl flex items-center space-x-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0" />
-                  <span>{walletError}</span>
-                </div>
-              )}
-            </div>
           </Card>
         </div>
 
         <div className="space-y-6">
+          <Card className="bg-slate-900/40 border-slate-800 p-5 rounded-2xl shadow-xl">
+<div className="space-y-4">
+  <div className="flex items-center justify-between gap-3">
+    <h3 className="flex items-center text-sm font-bold uppercase tracking-wider text-slate-300">
+      <Ticket className="mr-2 h-4 w-4 text-emerald-400" />
+      Select Your Numbers
+    </h3>
+
+    <div className="flex items-center space-x-2">
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={handleQuickPick}
+        disabled={bettingClosed}
+        className="h-8 border-slate-700 bg-slate-800/40 text-xs text-slate-300 hover:bg-slate-800"
+      >
+        <Zap className="mr-1 h-3 w-3 text-amber-400" />
+        Quick Pick
+      </Button>
+
+      {selectedNumbers.length > 0 && (
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setSelectedNumbers([])}
+          disabled={bettingClosed}
+          className="h-8 text-xs text-slate-400 hover:text-red-400"
+        >
+          Clear
+        </Button>
+      )}
+    </div>
+  </div>
+
+  {/* Ordered selected-number slots */}
+  <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+    <div className="mb-4 flex items-start justify-between gap-4">
+      <div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+          Your Ordered Combination
+        </div>
+
+        <p className="mt-1 text-xs text-slate-500">
+          Numbers are recorded in the exact order
+          you select them. Duplicate digits are allowed.
+        </p>
+      </div>
+
+      <div className="shrink-0 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5 font-mono text-xs font-bold text-slate-300">
+        {selectedNumbers.length}/
+        {activeGame.pickCount}
+      </div>
+    </div>
+
+    <div
+      className="grid gap-3"
+      style={{
+        gridTemplateColumns: `repeat(${activeGame.pickCount}, minmax(0, 1fr))`,
+      }}
+    >
+      {Array.from(
+        { length: activeGame.pickCount },
+        (_, index) => {
+          const selectedNumber =
+            selectedNumbers[index];
+
+          const hasNumber =
+            selectedNumber !== undefined;
+
+          return (
+            <button
+              key={index}
+              type="button"
+              onClick={() => {
+                if (hasNumber) {
+                  removeSelectedNumber(index);
+                }
+              }}
+              disabled={
+                !hasNumber || bettingClosed
+              }
+              className={`relative flex min-h-24 flex-col items-center justify-center rounded-xl border transition-all ${
+                hasNumber
+                  ? "border-emerald-500 bg-gradient-to-b from-emerald-600 to-emerald-700 text-white shadow-lg shadow-emerald-950/40"
+                  : "border-dashed border-slate-700 bg-slate-900/60 text-slate-600"
+              } ${
+                hasNumber &&
+                !bettingClosed
+                  ? "cursor-pointer hover:-translate-y-0.5 hover:border-emerald-400 hover:from-emerald-500 hover:to-emerald-600"
+                  : "cursor-default"
+              }`}
+              title={
+                hasNumber
+                  ? `Remove the ${getOrdinalLabel(index)} selected number`
+                  : `Waiting for the ${getOrdinalLabel(index)} number`
+              }
+            >
+              <span
+                className={`absolute left-2 top-2 rounded-md border px-2 py-0.5 text-[9px] font-black uppercase tracking-wider ${
+                  hasNumber
+                    ? "border-emerald-300/30 bg-emerald-950/40 text-emerald-100"
+                    : "border-slate-700 bg-slate-800 text-slate-500"
+                }`}
+              >
+                {getOrdinalLabel(index)}
+              </span>
+
+              <span className="font-mono text-4xl font-black">
+                {hasNumber
+                  ? selectedNumber
+                  : "—"}
+              </span>
+
+              <span
+                className={`mt-1 text-[9px] font-semibold uppercase ${
+                  hasNumber
+                    ? "text-emerald-100/80"
+                    : "text-slate-600"
+                }`}
+              >
+                {hasNumber
+                  ? "Click to remove"
+                  : "Not selected"}
+              </span>
+            </button>
+          );
+        },
+      )}
+    </div>
+
+ 
+  </div>
+
+  {/* Available digits */}
+  <div>
+    <div className="mb-2 flex items-center justify-between">
+      <span className="text-[5px] font-bold uppercase tracking-wider text-slate-500">
+        Available Digits
+      </span>
+
+      {selectedNumbers.length >=
+        activeGame.pickCount && (
+        <span className="text-[10px] font-semibold text-emerald-400">
+          Combination complete
+        </span>
+      )}
+    </div>
+
+    <div className="grid grid-cols-5 gap-2 sm:grid-cols-10">
+      {Array.from(
+        {
+          length:
+            activeGame.maxNumber + 1,
+        },
+        (_, number) => {
+          const selectionPositions =
+            selectedNumbers
+              .map(
+                (
+                  selectedNumber,
+                  position,
+                ) =>
+                  selectedNumber ===
+                  number
+                    ? position
+                    : -1,
+              )
+              .filter(
+                (position) =>
+                  position !== -1,
+              );
+
+          const isSelected =
+            selectionPositions.length > 0;
+
+          const selectionLimitReached =
+            selectedNumbers.length >=
+            activeGame.pickCount;
+
+          return (
+            <button
+              key={number}
+              type="button"
+              onClick={() =>
+                toggleNumber(number)
+              }
+              disabled={
+                bettingClosed ||
+                selectionLimitReached
+              }
+              className={`relative flex h-14 items-center justify-center rounded-xl border font-mono text-lg font-black transition-all ${
+                isSelected
+                  ? "border-emerald-600 bg-emerald-950/60 text-emerald-300 shadow-lg shadow-emerald-950/30"
+                  : "border-slate-800 bg-slate-950/60 text-slate-300 hover:-translate-y-0.5 hover:border-emerald-700 hover:bg-slate-800/60 hover:text-white"
+              } ${
+                bettingClosed ||
+                selectionLimitReached
+                  ? "cursor-not-allowed opacity-50"
+                  : "cursor-pointer"
+              }`}
+            >
+              {number}
+
+              {selectionPositions.length >
+                0 && (
+                <div className="absolute -right-1.5 -top-1.5 flex flex-wrap justify-end gap-0.5">
+                  {selectionPositions.map(
+                    (position) => (
+                      <span
+                        key={position}
+                        className="flex h-5 min-w-5 items-center justify-center rounded-full border border-emerald-300 bg-emerald-600 px-1 text-[8px] font-black text-white shadow-md"
+                        title={`${getOrdinalLabel(position)} selected number`}
+                      >
+                        {position + 1}
+                      </span>
+                    ),
+                  )}
+                </div>
+              )}
+            </button>
+          );
+        },
+      )}
+    </div>
+  </div>
+
+
+
+  <div className="flex flex-col items-center justify-between gap-4 border-t border-slate-800 pt-4 sm:flex-row">
+    <div>
+      <div className="text-xs text-slate-400">
+        Ticket Price
+      </div>
+
+      <div className="text-base font-bold text-white">
+        {bchPriceFormatted(
+          activeGame.ticketPriceSats,
+        )}{" "}
+        <span className="text-xs font-normal text-slate-400">
+          (
+          {phpPriceFormatted(
+            activeGame.ticketPriceSats,
+          )}
+          )
+        </span>
+      </div>
+    </div>
+
+    <div className="flex w-full items-center space-x-3 sm:w-auto">
+      <Button
+        onClick={handleBuyTicket}
+        disabled={
+          txPending ||
+          bettingClosed ||
+          !bettorAddress ||
+          selectedNumbers.length !==
+            activeGame.pickCount
+        }
+        className="h-11 flex-1 rounded-xl bg-emerald-600 px-8 text-sm font-bold text-white shadow-lg shadow-emerald-900/40 hover:bg-emerald-500 disabled:opacity-50 sm:flex-none"
+      >
+        {txPending
+          ? usingPaytaca
+            ? "Confirm in Paytaca..."
+            : "Purchasing..."
+          : bettingClosed
+            ? "Betting Closed"
+            : !bettorAddress
+              ? "Connect a Wallet First"
+              : selectedNumbers.length !==
+                    activeGame.pickCount
+                  ? `Select ${activeGame.pickCount} Numbers`
+                  : `Buy ${selectedNumbers.join("-")} On-Chain`}
+      </Button>
+    </div>
+  </div>
+
+  {chainError && (
+    <div className="flex items-center space-x-2 rounded-xl border border-red-900/60 bg-red-950/40 p-3 text-xs text-red-400">
+      <AlertTriangle className="h-4 w-4 shrink-0" />
+      <span>{chainError}</span>
+    </div>
+  )}
+
+  {walletError && (
+    <div className="flex items-center space-x-2 rounded-xl border border-red-900/60 bg-red-950/40 p-3 text-xs text-red-400">
+      <AlertTriangle className="h-4 w-4 shrink-0" />
+      <span>{walletError}</span>
+    </div>
+  )}
+</div>
+          </Card>
+
           {simulationMode ? (
             <Card className="bg-amber-950/20 border-amber-800/50 p-6 rounded-2xl shadow-xl space-y-3">
               <h3 className="text-sm font-bold uppercase tracking-wider text-amber-300 flex items-center">
@@ -1346,43 +2013,10 @@ export default function App() {
                 Simulation Mode Active
               </h3>
               <p className="text-[11px] text-amber-100/80">
-                Seeding, buying tickets, drawing, and resolving all run against
-                local in-memory state — nothing touches chipnet, the faucet, or
-                a wallet. Safe to demo repeatedly, no funding needed.
+                Ticket purchases accumulate in a simulated jackpot wallet.
+                Drawing and resolving use local in-memory state, so no real BCH
+                or contract seed deposit is required.
               </p>
-
-              <div>
-                <label
-                  htmlFor="sim-seed-amount"
-                  className="text-[10px] uppercase font-bold text-amber-200/80 mb-1 block"
-                >
-                  Jackpot Seed Amount (BCH)
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="sim-seed-amount"
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={simSeedAmountBch}
-                    onChange={(e) => setSimSeedAmountBch(e.target.value)}
-                    disabled={activeContractSats !== 0n}
-                    className="flex-1 bg-slate-950/70 border border-amber-800/50 rounded-lg px-3 py-2 text-xs font-mono text-amber-100 focus:outline-none focus:border-amber-500 disabled:opacity-50"
-                    placeholder="e.g. 1.0"
-                  />
-                  <span className="text-[10px] text-amber-200/60 shrink-0">
-                    {bchStringToSats(simSeedAmountBch)
-                      ? phpPriceFormatted(bchStringToSats(simSeedAmountBch)!)
-                      : "invalid"}
-                  </span>
-                </div>
-                {activeContractSats !== 0n && (
-                  <p className="text-[10px] text-amber-200/60 mt-1">
-                    Pool already seeded for this round — reset simulation to
-                    seed a different amount.
-                  </p>
-                )}
-              </div>
 
               <Button
                 onClick={handleResetSimulation}
@@ -1394,7 +2028,7 @@ export default function App() {
               </Button>
             </Card>
           ) : (
-            activeAddress && (
+            bettorAddress && (
               <Card className="bg-slate-900/40 border-slate-800 p-6 rounded-2xl shadow-xl space-y-4">
                 <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center">
                   <Droplets className="w-4 h-4 mr-2 text-emerald-400" />
@@ -1407,10 +2041,10 @@ export default function App() {
                   </div>
                   <div className="flex items-stretch bg-slate-950/70 border border-slate-800 rounded-xl overflow-hidden">
                     <div className="flex-1 px-3 py-2.5 text-[11px] font-mono text-slate-300 break-all select-all">
-                      {activeAddress}
+                      {bettorAddress}
                     </div>
                     <button
-                      onClick={() => copyAddress(activeAddress)}
+                      onClick={() => copyAddress(bettorAddress)}
                       className={`shrink-0 flex items-center justify-center px-3 border-l transition-colors ${
                         addressCopied
                           ? "border-emerald-800/60 bg-emerald-950/40 text-emerald-400"
@@ -1512,9 +2146,11 @@ export default function App() {
                 </div>
                 <div className="text-right">
                   <div className="text-xs font-mono font-bold text-emerald-400">
-                    {bchPriceFormatted(gameContractSats[activeGame.id] ?? 0n)}
+                    {jackpotBalanceLoading
+                      ? "Loading..."
+                      : bchPriceFormatted(jackpotBalanceSats)}
                   </div>
-                  <div className="text-[10px] text-slate-400">Pool Balance</div>
+                  <div className="text-[10px] text-slate-400">Permanent Jackpot Wallet</div>
                 </div>
               </div>
             </div>
@@ -1602,9 +2238,9 @@ export default function App() {
                 className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm h-11 rounded-xl shadow-lg shadow-emerald-900/40 disabled:opacity-50"
               >
                 {forceDrawPending
-                  ? chainChecking
-                    ? "Checking chain..."
-                    : "Starting draw..."
+                  ? simulationMode
+                    ? "Starting simulated draw..."
+                    : "Generating result..."
                   : drawPending
                     ? "Drawing..."
                     : "Draw Now"}
@@ -1634,6 +2270,7 @@ export default function App() {
               on-chain and won an estimated prize of{" "}
               <strong className="text-emerald-400">₱{wonPrizePhp}</strong>!
             </p>
+
             <Button
               onClick={() => setShowPopupCelebration(false)}
               className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm h-10 rounded-xl"

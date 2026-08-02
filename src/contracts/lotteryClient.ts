@@ -10,7 +10,11 @@ import {
 import type { Utxo } from "cashscript";
 import { secp256k1 } from "@bitauth/libauth";
 import CompleteLotteryArtifact from "./Lottery.json";
-import { signWithPaytaca, type PaytacaSignedTx } from "./paytacaConnect";
+import { signWithPaytaca, type PaytacaSignedTx } from "./paytacaconnect";
+import {
+  normalizeChipnetAddress,
+  toTokenAwareChipnetAddress,
+} from "./wallet";
 
 const provider = new ElectrumNetworkProvider("chipnet");
 
@@ -69,207 +73,302 @@ export function getLotteryContract(params: LotteryParams) {
   );
 }
 
-// --- seedContract ---------------------------------------------------------
-export async function seedContract(
-  contract: Contract,
-  amountSats: bigint,
-  funderPrivateKey: Uint8Array,
-  funderAddress: string,
-) {
-  const funderUtxos = await provider.getUtxos(funderAddress);
-  const fundingUtxo = funderUtxos.find(
-    (u: Utxo) => !u.token && u.satoshis >= amountSats + 1000n,
-  );
-  if (!fundingUtxo) {
-    throw new Error(
-      "Wallet has no UTXO large enough to seed the contract (amount + fee).",
-    );
-  }
-
-  const sigTemplate = new SignatureTemplate(funderPrivateKey);
-  const builder = new TransactionBuilder({ provider });
-  builder
-    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
-    .addOutput({ to: contract.address, amount: amountSats })
-    .addBchChangeOutputIfNeeded({ to: funderAddress, feeRate: 1.0 });
-
-  return builder.send();
-}
+// --- Direct jackpot-wallet ticket purchase ---------------------------------
 
 /**
- * Seed the contract using a Paytaca-connected wallet instead of a local
- * private key. Paytaca signs the funding input over WalletConnect.
+ * Ticket purchases now pay a fixed jackpot P2PKH wallet directly.
+ *
+ * There is deliberately no seed/fund transaction and no requirement for an
+ * existing CashScript contract UTXO. The bettor only spends their own BCH
+ * input and creates the jackpot payment output. Ticket metadata remains in the
+ * frontend/backend rather than being added to the WalletConnect transaction.
+ *
+ * Note: because a normal P2PKH jackpot wallet is used, this function does not
+ * mint the previous contract-controlled CashToken NFT. Persist the returned
+ * txid together with the buyer address and picked number in your backend.
  */
-export async function seedContractViaPaytaca(
-  contract: Contract,
-  amountSats: bigint,
-  funderAddress: string,
-): Promise<PaytacaSignedTx> {
-  const funderUtxos = await provider.getUtxos(funderAddress);
-  const fundingUtxo = funderUtxos.find(
-    (u: Utxo) => !u.token && u.satoshis >= amountSats + 1000n,
-  );
-  if (!fundingUtxo) {
-    throw new Error(
-      "Paytaca wallet has no UTXO large enough to seed the contract (amount + fee). Use the faucet first.",
-    );
-  }
-
-  const builder = new TransactionBuilder({ provider });
-  builder
-    .addInput(fundingUtxo, placeholderP2PKHUnlocker(funderAddress))
-    .addOutput({ to: contract.address, amount: amountSats })
-    .addBchChangeOutputIfNeeded({ to: funderAddress, feeRate: 1.0 });
-
-  const wcTransactionObj = builder.generateWcTransactionObject({
-    broadcast: true,
-    userPrompt: "Seed the Swertres lottery jackpot",
-  });
-
-  const result = await signWithPaytaca(wcTransactionObj);
-  if (!result)
-    throw new Error("Paytaca declined to sign the seed transaction.");
-  return result;
-}
-
-// --- buyTicket (local private-key demo wallet) ---------------------------
 export async function buyTicket(
-  contract: Contract,
+  jackpotAddress: string,
   ticketPriceSats: bigint,
   buyerPkHash: Uint8Array,
   pickedNumber: number | bigint,
   buyerPrivateKey: Uint8Array,
   buyerAddress: string,
 ) {
-  const contractUtxos = await contract.getUtxos();
-  if (contractUtxos.length === 0) {
-    throw new Error("Lottery contract has no UTXO yet — fund/seed it first.");
-  }
+  const normalizedBuyerAddress =
+    normalizeChipnetAddress(buyerAddress);
 
-  // Contract UTXO MUST be Input 0
-  const contractUtxo = contractUtxos.reduce((best, u) =>
-    u.satoshis > best.satoshis ? u : best,
-  );
+  const normalizedJackpotAddress =
+    normalizeChipnetAddress(jackpotAddress);
 
-  const buyerUtxos = await provider.getUtxos(buyerAddress);
+  const buyerUtxos =
+    await provider.getUtxos(normalizedBuyerAddress);
+
   const fundingUtxo = buyerUtxos.find(
-    (u: Utxo) => !u.token && u.satoshis >= ticketPriceSats + 2000n,
+    (utxo: Utxo) =>
+      !utxo.token &&
+      BigInt(utxo.satoshis) >= ticketPriceSats + 1500n,
   );
+
   if (!fundingUtxo) {
     throw new Error(
-      "Buyer wallet has no UTXO large enough to cover ticket price + fee.",
+      "Buyer wallet has no UTXO large enough to cover the ticket price and network fee.",
     );
   }
 
-  const sigTemplate = new SignatureTemplate(buyerPrivateKey);
-  const newContractBalance = contractUtxo.satoshis + ticketPriceSats;
-  const numberHex = numberToScriptNumHex(pickedNumber);
+  const sigTemplate =
+    new SignatureTemplate(buyerPrivateKey);
 
-  const builder = new TransactionBuilder({ provider });
+  const numberHex =
+    numberToScriptNumHex(pickedNumber);
+
+  const builder =
+    new TransactionBuilder({ provider });
+
   builder
-    // Input 0: Contract Jackpot UTXO
     .addInput(
-      contractUtxo,
-      contract.unlock.buyTicket(buyerPkHash, BigInt(pickedNumber)),
+      fundingUtxo,
+      sigTemplate.unlockP2PKH(),
     )
-    // Input 1: Buyer Funding UTXO
-    .addInput(fundingUtxo, sigTemplate.unlockP2PKH())
-    // Output 0: Contract Continuation (Jackpot + Ticket Price)
-    .addOutput({ to: contract.address, amount: newContractBalance })
-    // Output 1: CashToken NFT Ticket sent to buyer
-    // Token Category MUST match contractUtxo.txid or contract's token category logic
     .addOutput({
-      to: buyerAddress,
-      amount: 1000n,
-      token: {
-        category: contractUtxo.token?.category || contractUtxo.txid,
-        amount: 0n,
-        nft: {
-          capability: "none",
-          commitment: numberHex,
-        },
-      },
+      to: normalizedJackpotAddress,
+      amount: ticketPriceSats,
     })
-    // Output 2: OP_RETURN Audit Record
-    .addOpReturnOutput([`0x${bytesToHex(buyerPkHash)}`, `0x${numberHex}`])
-    .addBchChangeOutputIfNeeded({ to: buyerAddress, feeRate: 1.2 });
+    .addBchChangeOutputIfNeeded({
+      to: normalizedBuyerAddress,
+      feeRate: 3.0,
+    });
 
   return builder.send();
 }
 
-// --- buyTicket (Paytaca WalletConnect) ------------------------------------
 /**
- * Same as buyTicket() above, but the buyer's funding input is signed by a
- * connected Paytaca wallet over WalletConnect instead of a local private key.
- * The oracle/contract-covenant input still unlocks with `contract.unlock`,
- * since it doesn't require the buyer's signature — only their funding UTXO
- * (input 1) does, so that's the one we hand to Paytaca as a placeholder.
+ * Paytaca version of the direct jackpot-wallet ticket purchase.
+ * Paytaca signs only the bettor's P2PKH input through WalletConnect.
  */
 export async function buyTicketViaPaytaca(
-  contract: Contract,
+  jackpotAddress: string,
   ticketPriceSats: bigint,
   buyerAddress: string,
   buyerPkHash: Uint8Array,
   pickedNumber: number | bigint,
 ): Promise<PaytacaSignedTx> {
-  const contractUtxos = await contract.getUtxos();
-  if (contractUtxos.length === 0) {
-    throw new Error("Lottery contract has no UTXO yet — fund/seed it first.");
-  }
+  const normalizedBuyerAddress =
+    normalizeChipnetAddress(buyerAddress);
 
-  const contractUtxo = contractUtxos.reduce((best, u) =>
-    u.satoshis > best.satoshis ? u : best,
-  );
+  const normalizedJackpotAddress =
+    normalizeChipnetAddress(jackpotAddress);
 
-  const buyerUtxos = await provider.getUtxos(buyerAddress);
+  const buyerUtxos =
+    await provider.getUtxos(normalizedBuyerAddress);
+
   const fundingUtxo = buyerUtxos.find(
-    (u: Utxo) => !u.token && u.satoshis >= ticketPriceSats + 2000n,
+    (utxo: Utxo) =>
+      !utxo.token &&
+      BigInt(utxo.satoshis) >= ticketPriceSats + 1500n,
   );
+
   if (!fundingUtxo) {
     throw new Error(
-      "Paytaca wallet has no UTXO large enough to cover ticket price + fee. Use the faucet first.",
+      "Paytaca wallet has no UTXO large enough to cover the ticket price and network fee. Use the faucet first.",
     );
   }
 
-  const newContractBalance = contractUtxo.satoshis + ticketPriceSats;
-  const numberHex = numberToScriptNumHex(pickedNumber);
+  const numberHex =
+    numberToScriptNumHex(pickedNumber);
 
-  const builder = new TransactionBuilder({ provider });
+  const builder =
+    new TransactionBuilder({ provider });
+
   builder
-    // Input 0: Contract Jackpot UTXO (unlocked via the covenant, no wallet sig needed)
     .addInput(
-      contractUtxo,
-      contract.unlock.buyTicket(buyerPkHash, BigInt(pickedNumber)),
+      fundingUtxo,
+      placeholderP2PKHUnlocker(
+        normalizedBuyerAddress,
+      ),
     )
-    // Input 1: Buyer Funding UTXO — placeholder, filled in by Paytaca
-    .addInput(fundingUtxo, placeholderP2PKHUnlocker(buyerAddress))
-    // Output 0: Contract Continuation (Jackpot + Ticket Price)
-    .addOutput({ to: contract.address, amount: newContractBalance })
-    // Output 1: CashToken NFT Ticket sent to buyer
     .addOutput({
-      to: buyerAddress,
-      amount: 1000n,
-      token: {
-        category: contractUtxo.token?.category || contractUtxo.txid,
-        amount: 0n,
-        nft: {
-          capability: "none",
-          commitment: numberHex,
-        },
-      },
+      to: normalizedJackpotAddress,
+      amount: ticketPriceSats,
     })
-    // Output 2: OP_RETURN Audit Record
-    .addOpReturnOutput([`0x${bytesToHex(buyerPkHash)}`, `0x${numberHex}`])
-    .addBchChangeOutputIfNeeded({ to: buyerAddress, feeRate: 1.2 });
+    .addBchChangeOutputIfNeeded({
+      to: normalizedBuyerAddress,
+      feeRate: 3.0,
+    });
 
-  const wcTransactionObj = builder.generateWcTransactionObject({
-    broadcast: true,
-    userPrompt: `Buy Swertres ticket #${numberHex ? pickedNumber : pickedNumber}`,
+  const wcTransactionObj =
+    builder.generateWcTransactionObject({
+      // Paytaca only signs. The dapp broadcasts through Electrum below.
+      // A 3 sat/byte fee rate is used above because the final DER signature
+      // can be larger than the WalletConnect placeholder used for estimation.
+      broadcast: false,
+      userPrompt:
+        `Buy 3D Lotto ticket #${pickedNumber.toString()} for ${Number(ticketPriceSats) / 1e8} BCH`,
+    });
+
+  const result =
+    await signWithPaytaca(wcTransactionObj);
+
+  if (
+    !result ||
+    typeof result.signedTransaction !== "string" ||
+    !result.signedTransaction
+  ) {
+    throw new Error(
+      "Paytaca did not return a signed transaction.",
+    );
+  }
+
+  let broadcastTxid: string;
+
+  try {
+    broadcastTxid = await provider.sendRawTransaction(
+      result.signedTransaction,
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : JSON.stringify(error);
+
+    throw new Error(
+      `The ticket was signed, but broadcasting failed: ${message}`,
+    );
+  }
+
+  return {
+    ...result,
+    signedTransactionHash: broadcastTxid,
+  };
+}
+
+
+/**
+ * Spend all non-token BCH UTXOs from the jackpot wallet and send the balance,
+ * minus the network fee, to the winning wallet.
+ *
+ * The connected Paytaca wallet MUST be the jackpot wallet because Paytaca
+ * signs the P2PKH inputs. This function does not embed any private key.
+ */
+export async function payWinnerViaPaytaca(
+  jackpotAddress: string,
+  winnerAddress: string,
+): Promise<PaytacaSignedTx> {
+  const normalizedJackpotAddress =
+    normalizeChipnetAddress(jackpotAddress);
+
+  const normalizedWinnerAddress =
+    normalizeChipnetAddress(winnerAddress);
+
+  const jackpotUtxos =
+    await provider.getUtxos(
+      normalizedJackpotAddress,
+    );
+
+  const spendableUtxos =
+    jackpotUtxos.filter(
+      (utxo: Utxo) => !utxo.token,
+    );
+
+  if (spendableUtxos.length === 0) {
+    throw new Error(
+      "The jackpot wallet has no spendable BCH.",
+    );
+  }
+
+  const totalSats =
+    spendableUtxos.reduce(
+      (sum, utxo) =>
+        sum + BigInt(utxo.satoshis),
+      0n,
+    );
+
+  /**
+   * Conservative fee reserve. Any remainder beyond the actual required fee is
+   * included in the miner fee because this transaction empties the jackpot.
+   */
+  const feeReserve =
+    1200n +
+    BigInt(spendableUtxos.length) * 900n;
+
+  if (totalSats <= feeReserve) {
+    throw new Error(
+      "The jackpot is too small to cover the payout network fee.",
+    );
+  }
+
+  const payoutAmount =
+    totalSats - feeReserve;
+
+  const builder =
+    new TransactionBuilder({
+      provider,
+    });
+
+  for (const utxo of spendableUtxos) {
+    builder.addInput(
+      utxo,
+      placeholderP2PKHUnlocker(
+        normalizedJackpotAddress,
+      ),
+    );
+  }
+
+  builder.addOutput({
+    to: normalizedWinnerAddress,
+    amount: payoutAmount,
   });
 
-  const result = await signWithPaytaca(wcTransactionObj);
-  if (!result) throw new Error("Paytaca declined to sign the ticket purchase.");
-  return result;
+  const wcTransactionObj =
+    builder.generateWcTransactionObject({
+      broadcast: false,
+      userPrompt:
+        `Send ${Number(payoutAmount) / 1e8} BCH jackpot to ${normalizedWinnerAddress}`,
+    });
+
+  const result =
+    await signWithPaytaca(
+      wcTransactionObj,
+    );
+
+  if (
+    !result ||
+    typeof result.signedTransaction !==
+      "string" ||
+    !result.signedTransaction
+  ) {
+    throw new Error(
+      "Paytaca did not return a signed jackpot payout transaction.",
+    );
+  }
+
+  let broadcastTxid: string;
+
+  try {
+    broadcastTxid =
+      await provider.sendRawTransaction(
+        result.signedTransaction,
+      );
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : JSON.stringify(error);
+
+    throw new Error(
+      `The jackpot payout was signed, but broadcasting failed: ${message}`,
+    );
+  }
+
+  return {
+    ...result,
+    signedTransactionHash:
+      broadcastTxid,
+  };
 }
 
 // --- Oracle signing ---------------------------------------------------------
@@ -304,7 +403,9 @@ export async function resolveDraw(
   }
   const contractUtxo = contractUtxos[0];
 
-  const winnerUtxos = await provider.getUtxos(winnerAddress);
+  const normalizedWinnerAddress = normalizeChipnetAddress(winnerAddress);
+  const winnerTokenAddress = toTokenAwareChipnetAddress(normalizedWinnerAddress);
+  const winnerUtxos = await provider.getUtxos(winnerTokenAddress);
   const numberHex = numberToScriptNumHex(winningNumber);
 
   const winnerNftUtxo = winnerUtxos.find(
@@ -334,7 +435,7 @@ export async function resolveDraw(
       ),
     )
     .addInput(winnerNftUtxo, sigTemplate.unlockP2PKH())
-    .addOutput({ to: winnerAddress, amount: payoutAmount });
+    .addOutput({ to: normalizedWinnerAddress, amount: payoutAmount });
 
   return builder.send();
 }
@@ -358,7 +459,9 @@ export async function resolveDrawViaPaytaca(
   }
   const contractUtxo = contractUtxos[0];
 
-  const winnerUtxos = await provider.getUtxos(winnerAddress);
+  const normalizedWinnerAddress = normalizeChipnetAddress(winnerAddress);
+  const winnerTokenAddress = toTokenAwareChipnetAddress(normalizedWinnerAddress);
+  const winnerUtxos = await provider.getUtxos(winnerTokenAddress);
   const numberHex = numberToScriptNumHex(winningNumber);
 
   const winnerNftUtxo = winnerUtxos.find(
@@ -387,8 +490,8 @@ export async function resolveDrawViaPaytaca(
       ),
     )
     // Input 1: Winner's ticket NFT — placeholder, filled in by Paytaca
-    .addInput(winnerNftUtxo, placeholderP2PKHUnlocker(winnerAddress))
-    .addOutput({ to: winnerAddress, amount: payoutAmount });
+    .addInput(winnerNftUtxo, placeholderP2PKHUnlocker(normalizedWinnerAddress))
+    .addOutput({ to: normalizedWinnerAddress, amount: payoutAmount });
 
   const wcTransactionObj = builder.generateWcTransactionObject({
     broadcast: true,
@@ -407,6 +510,7 @@ export async function reclaimRefund(
   buyerPrivateKey: Uint8Array,
   buyerAddress: string,
 ) {
+  const normalizedBuyerAddress = normalizeChipnetAddress(buyerAddress);
   const contractUtxos = await contract.getUtxos();
   if (contractUtxos.length === 0) {
     throw new Error("Lottery contract has no UTXO to refund.");
@@ -423,7 +527,7 @@ export async function reclaimRefund(
       contract.unlock.reclaimRefund(buyerPublicKey, sigTemplate),
     )
     .addOutput({
-      to: buyerAddress,
+      to: normalizedBuyerAddress,
       amount: contractUtxo.satoshis - 1500n,
     });
 
@@ -441,6 +545,7 @@ export async function reclaimRefundViaPaytaca(
   contract: Contract,
   buyerAddress: string,
 ): Promise<PaytacaSignedTx> {
+  const normalizedBuyerAddress = normalizeChipnetAddress(buyerAddress);
   const contractUtxos = await contract.getUtxos();
   if (contractUtxos.length === 0) {
     throw new Error("Lottery contract has no UTXO to refund.");
@@ -459,7 +564,7 @@ export async function reclaimRefundViaPaytaca(
       ),
     )
     .addOutput({
-      to: buyerAddress,
+      to: normalizedBuyerAddress,
       amount: contractUtxo.satoshis - 1500n,
     });
 
